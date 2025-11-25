@@ -14,7 +14,7 @@ bl_info = {
     "name": "StableGen",
     "category": "Object",
     "author": "Ondrej Sakala",
-    "version": (0, 1, 0),
+    "version": (0, 1, 1),
     'blender': (4, 2, 0)
 }
 
