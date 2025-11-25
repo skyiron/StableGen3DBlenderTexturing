@@ -82,11 +82,14 @@ class WorkflowManager:
         initial_model_input = [NODES['unet_loader'], 0]
         dummy_clip_input = [NODES['unet_loader'], 0] # Dummy, not used by LoraLoaderModelOnly
 
+        is_nunchaku = context.scene.model_name.lower().endswith('.safetensors')
+        lora_class = "NunchakuQwenImageLoraLoader" if is_nunchaku else "LoraLoaderModelOnly"
+
         prompt, final_lora_model_out, _ = self._build_lora_chain(
             prompt, context,
             initial_model_input, dummy_clip_input,
             start_node_id=500, # Use a high starting ID to avoid conflicts
-            lora_class_type="LoraLoaderModelOnly" # Specify model-only loader
+            lora_class_type=lora_class # Specify model-only loader
         )
 
         # Connect the output of the LoRA chain to the next node in the model path
@@ -244,7 +247,21 @@ class WorkflowManager:
         prompt[NODES['sampler']]['inputs']['denoise'] = 1.0 # Typically 1.0 for this kind of edit
 
         # --- Set UNET model ---
-        prompt[NODES['unet_loader']]['inputs']['unet_name'] = context.scene.model_name
+        if is_nunchaku:
+             prompt[NODES['unet_loader']] = {
+                "inputs": {
+                    "model_name": context.scene.model_name,
+                    "cpu_offload": "auto",
+                    "num_blocks_on_gpu": 1,
+                    "use_pin_memory": "enable"
+                },
+                "class_type": "NunchakuQwenImageDiTLoader",
+                "_meta": {
+                    "title": "Nunchaku Qwen-Image DiT Loader"
+                }
+             }
+        else:
+            prompt[NODES['unet_loader']]['inputs']['unet_name'] = context.scene.model_name
 
         # --- Execute ---
         self._save_prompt_to_file(prompt, revision_dir)
@@ -585,6 +602,13 @@ class WorkflowManager:
             if lora_class_type == "LoraLoader":
                 lora_inputs["strength_clip"] = lora_unit.clip_strength
                 lora_inputs["clip"] = current_clip_out
+            elif lora_class_type == "NunchakuQwenImageLoraLoader":
+                lora_inputs = {
+                    "lora_name": lora_unit.model_name,
+                    "lora_strength": lora_unit.model_strength,
+                    "cpu_offload": "disable",
+                    "model": current_model_out
+                }
 
             prompt[lora_node_id_str] = {
                 "inputs": lora_inputs,

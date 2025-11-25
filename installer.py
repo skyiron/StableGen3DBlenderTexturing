@@ -153,6 +153,27 @@ DEPENDENCIES: Dict[str, Dict[str, Any]] = {
         "target_path_relative": "models/loras", "filename": "Qwen-Image-Lightning-4steps-V1.0-bf16.safetensors",
         "license": "Apache 2.0", "size_mb": 850, "packages": ["qwen_extras"]
     },
+    # Nunchaku Qwen
+    "cn_nunchaku": {
+        "id": "cn_nunchaku", "type": "node", "name": "ComfyUI Nunchaku",
+        "git_url": "https://github.com/nunchaku-tech/ComfyUI-nunchaku.git",
+        "target_dir_relative": "custom_nodes",
+        "repo_name": "ComfyUI-nunchaku",
+        "license": "Apache 2.0", "packages": ["qwen_nunchaku"]
+    },
+    "cn_qwen_lora_loader": {
+        "id": "cn_qwen_lora_loader", "type": "node", "name": "ComfyUI Qwen Image LoRA Loader",
+        "git_url": "https://github.com/ussoewwin/ComfyUI-QwenImageLoraLoader.git",
+        "target_dir_relative": "custom_nodes",
+        "repo_name": "ComfyUI-QwenImageLoraLoader",
+        "license": "Apache 2.0", "packages": ["qwen_nunchaku"]
+    },
+    "model_nunchaku_qwen": {
+        "id": "model_nunchaku_qwen", "type": "model", "name": "Nunchaku Qwen Image Edit 2509 (Int4)",
+        "url": "https://huggingface.co/nunchaku-tech/nunchaku-qwen-image-edit-2509/resolve/main/lightning-251115/svdq-int4_r128-qwen-image-edit-2509-lightning-4steps-251115.safetensors?download=true",
+        "target_path_relative": "models/diffusion_models", "filename": "svdq-int4_r128-qwen-image-edit-2509-lightning-4steps-251115.safetensors",
+        "license": "Apache 2.0", "size_mb": 12700, "packages": ["qwen_nunchaku"]
+    },
 }
 
 # Define what items each menu option entails by listing package tags
@@ -181,7 +202,11 @@ MENU_PACKAGES: Dict[str, Dict[str, Any]] = {
     '6': {"name": "[QWEN EXTRAS] Core + Lightning LoRAs",
         "tags": ["qwen_core", "qwen_extras"],
         "size_gb": 22.6,
-        "description_suffix": "*Adds additional Qwen Lightning LoRAs on top of the Qwen core install.*"}
+        "description_suffix": "*Adds additional Qwen Lightning LoRAs on top of the Qwen core install.*"},
+    '7': {"name": "[QWEN NUNCHAKU] Nunchaku Nodes + Model",
+        "tags": ["qwen_core", "qwen_nunchaku"],
+        "size_gb": 33.0,
+        "description_suffix": "*Installs Qwen Core components plus Nunchaku nodes and the Int4 quantized model (12.7GB).*"}
 }
 
 # --- Helper Functions ---

@@ -449,7 +449,7 @@ class ComfyUIGenerate(bpy.types.Operator):
 
         print("Executing ComfyUI Generation")
 
-        if context.scene.model_architecture == 'qwen_image_edit':
+        if context.scene.model_architecture == 'qwen_image_edit' and not context.scene.generation_mode == 'project_only':
             context.scene.generation_method = 'sequential' # Force sequential for Qwen Image Edit
 
         render = bpy.context.scene.render
@@ -737,7 +737,7 @@ class ComfyUIGenerate(bpy.types.Operator):
                         if obj.type == 'MESH' and obj.name in self._original_visibility:
                             obj.hide_render = self._original_visibility[obj.name]
                 if self._error:
-                    if self._error == "'25'" or self._error == "'111'":
+                    if self._error == "'25'" or self._error == "'111'" or self._error == "'5'":
                         # Probably canceled by user, quietly return
                         context.scene.generation_status = 'idle'
                         self.report({'WARNING'}, "Generation cancelled.")

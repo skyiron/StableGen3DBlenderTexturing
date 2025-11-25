@@ -733,7 +733,11 @@ class RefreshCheckpointList(bpy.types.Operator):
             model_type_desc = "UNET"
         elif architecture == 'qwen_image_edit':
             model_list = fetch_from_comfyui_api(context, "/models/unet_gguf")
-            model_type_desc = "UNET (GGUF)"
+            if model_list is not None:
+                to_extend = fetch_from_comfyui_api(context, "/models/diffusion_models")
+                if to_extend:
+                    model_list.extend(to_extend)
+            model_type_desc = "UNET (GGUF/Safetensors)"
 
         if model_list is None: # Config error
             _cached_checkpoint_list = [("NO_SERVER", "Set Server Address", "Cannot fetch")]

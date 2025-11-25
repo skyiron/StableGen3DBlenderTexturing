@@ -243,3 +243,30 @@ StableGen can interface with the experimental Qwen Image Edit 2509 workflow for 
     * **Qwen Image Edit Lightning 8-Step (bf16):** [https://huggingface.co/lightx2v/Qwen-Image-Lightning/resolve/main/Qwen-Image-Edit-2509/Qwen-Image-Edit-2509-Lightning-8steps-V1.0-bf16.safetensors?download=true](https://huggingface.co/lightx2v/Qwen-Image-Lightning/resolve/main/Qwen-Image-Edit-2509/Qwen-Image-Edit-2509-Lightning-8steps-V1.0-bf16.safetensors?download=true)
     * **Qwen Image Lightning 4-Step (bf16):** [https://huggingface.co/lightx2v/Qwen-Image-Lightning/resolve/main/Qwen-Image-Lightning-4steps-V1.0-bf16.safetensors?download=true](https://huggingface.co/lightx2v/Qwen-Image-Lightning/resolve/main/Qwen-Image-Lightning-4steps-V1.0-bf16.safetensors?download=true)
     * Each LoRA is licensed under Apache 2.0 and is approximately 850 MB.
+
+**7. (Optional) Nunchaku Qwen Setup**
+
+For users with NVIDIA GPUs on Linux or Windows (WSL2 recommended for best performance, though native Windows support is improving), Nunchaku offers a highly optimized inference engine for Qwen models.
+
+* **a) Install Required Custom Nodes**
+    1. Navigate to your ComfyUI custom nodes directory:
+        ```bash
+        cd <YourComfyUIDirectory>/custom_nodes/
+        ```
+    2. Clone the Nunchaku repository:
+        ```bash
+        git clone https://github.com/nunchaku-tech/ComfyUI-nunchaku.git
+        ```
+    3. Clone the Qwen Image LoRA Loader repository:
+        ```bash
+        git clone https://github.com/ussoewwin/ComfyUI-QwenImageLoraLoader.git
+        ```
+    4. Restart ComfyUI.
+
+* **b) Download the Nunchaku Quantized Model**
+    * **Directory:** `<YourComfyUIDirectory>/models/diffusion_models/`
+    * **Filename:** `svdq-int4_r128-qwen-image-edit-2509-lightning-4steps-251115.safetensors`
+    * **Download URL:** [https://huggingface.co/nunchaku-tech/nunchaku-qwen-image-edit-2509/resolve/main/lightning-251115/svdq-int4_r128-qwen-image-edit-2509-lightning-4steps-251115.safetensors?download=true](https://huggingface.co/nunchaku-tech/nunchaku-qwen-image-edit-2509/resolve/main/lightning-251115/svdq-int4_r128-qwen-image-edit-2509-lightning-4steps-251115.safetensors?download=true)
+    * **License:** Apache 2.0
+    * **Size:** ~12.7 GB
+
