@@ -227,6 +227,11 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                     simple_project_bake(context, i, obj, mat_id)
                 obj.data.uv_layers.remove(obj.data.uv_layers[-1]) # Remove the last UV map
 
+    # Switch to Cycles for OSL support
+    context.scene.render.engine = 'CYCLES'
+    context.scene.cycles.device = 'CPU'
+    context.scene.cycles.shading_system = True
+
     for obj in to_project:
 
         # Deselect all objects
@@ -395,12 +400,6 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
             normalize.operation = 'NORMALIZE'
             normalize.location = (-400, -500 + (-800) * (i))
             normalize_nodes.append(normalize)
-
-        
-            # Switch to Cycles for OSL support
-            context.scene.render.engine = 'CYCLES'
-            context.scene.cycles.device = 'CPU'
-            context.scene.cycles.shading_system = True
 
             # Add a script node
             script = nodes.new("ShaderNodeScript")
