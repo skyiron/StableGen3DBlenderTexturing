@@ -764,12 +764,9 @@ class StableGenPanel(bpy.types.Panel):
                 # --- Generation Mode Specifics ---
                 mode_specific_outer_box = draw_collapsible_section(advanced_params_box, "show_mode_specific_settings", "Generation Mode Specifics", icon="OPTIONS")
                 if mode_specific_outer_box: # This is the box where all mode-specific UIs should go
-
                     method = scene.generation_method
 
-                    # -------------------------
                     # Grid Mode Parameters
-                    # -------------------------
                     if method == 'grid':
                         # Draw Grid parameters directly into mode_specific_outer_box
                         row = mode_specific_outer_box.row()
@@ -807,9 +804,7 @@ class StableGenPanel(bpy.types.Panel):
                             split.label(text="Refine Upscale:")
                             split.prop(scene, "refine_upscale_method", text="")
 
-                    # -------------------------
                     # Separate Mode Parameters
-                    # -------------------------
                     elif method == 'separate':
                         row = mode_specific_outer_box.row()
                         row.alignment = 'CENTER'
@@ -861,17 +856,13 @@ class StableGenPanel(bpy.types.Panel):
                                         toggle=True, icon="HIDE_OFF",
                                     )
 
-                    # -------------------------
                     # Refine Mode Parameters
-                    # -------------------------
                     elif method == 'refine':
                         row = mode_specific_outer_box.row()
                         row.alignment = 'CENTER'
                         row.label(text="Refine Mode Parameters", icon='SHADERFX')
-
                         row = mode_specific_outer_box.row()
                         row.prop(scene, "denoise", text="Denoise")
-
                         row = mode_specific_outer_box.row()
                         row.prop(
                             scene,
@@ -880,7 +871,6 @@ class StableGenPanel(bpy.types.Panel):
                             toggle=True,
                             icon="TEXTURE",
                         )
-
                         row = mode_specific_outer_box.row()
                         row.prop(
                             scene,
@@ -889,7 +879,6 @@ class StableGenPanel(bpy.types.Panel):
                             toggle=True,
                             icon="MODIFIER",
                         )
-
                         if scene.sequential_ipadapter:
                             sub_ip_box_separate = mode_specific_outer_box.box()
 
@@ -930,14 +919,11 @@ class StableGenPanel(bpy.types.Panel):
                                         icon="HIDE_OFF",
                                     )
 
-                    # -------------------------
                     # UV Inpainting Parameters
-                    # -------------------------
                     elif method == 'uv_inpaint':
                         row = mode_specific_outer_box.row()
                         row.alignment = 'CENTER'
                         row.label(text="UV Inpainting Parameters", icon="IMAGE_PLANE")
-
                         row = mode_specific_outer_box.row()
                         row.prop(
                             scene,
@@ -946,7 +932,6 @@ class StableGenPanel(bpy.types.Panel):
                             toggle=True,
                             icon="TEXTURE",
                         )
-
                         row = mode_specific_outer_box.row()
                         row.prop(
                             scene,
@@ -956,9 +941,7 @@ class StableGenPanel(bpy.types.Panel):
                             icon="QUESTION",
                         )
 
-                    # -------------------------
                     # Sequential Mode Parameters
-                    # -------------------------
                     elif method == 'sequential':
                         row = mode_specific_outer_box.row()
                         row.alignment = 'CENTER'
@@ -1064,9 +1047,7 @@ class StableGenPanel(bpy.types.Panel):
                                         icon="HIDE_OFF",
                                     )
 
-                    # -------------------------
                     # Shared visibility controls
-                    # -------------------------
                     if method in {'uv_inpaint', 'sequential', 'refine'}:
                         row = mode_specific_outer_box.row()
                         row.prop(
