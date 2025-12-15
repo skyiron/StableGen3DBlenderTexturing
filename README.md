@@ -410,6 +410,8 @@ Here are some features we plan to implement in the future (in no particular orde
 * **Custom VAE, CLIP model selection:** Ability to select custom VAE and CLIP models in addition to custom ControlNet and LoRA models.
 * **Qwen workflow refinements:** Deeper integration for Qwen Image Edit, including UV inpainting and refine modes.
 * **Automatic camera placement improvements:** More advanced camera placement algorithms (e.g., based on model geometry).
+* **Refine mode improvements:** Features like brush based inpainting, and better blending for "Preserve Original Textures" mode.
+* **Z-Image support** (and eventual Z-Image editing model support)
 * **Mesh generation:** Integration of mesh generation capabilities.
 
 If you have any suggestions, please feel free to open an issue!
@@ -423,4 +425,4 @@ Ondřej Sakala
 * X/Twitter: `@sakalond`
 
 ---
-*Last Updated: December 12, 2025*
+*Last Updated: December 15, 2025*
