@@ -154,6 +154,116 @@ class WorkflowManager:
                     return "Change and transfer the format of '{main_prompt}' in image 1 to the style from image 2"
 
 
+    def generate_qwen_refine(self, context, camera_id=None):
+        """Generates an image using the Qwen-Image-Edit workflow for refinement."""
+        server_address = context.preferences.addons[__package__].preferences.server_address
+        client_id = str(uuid.uuid4())
+        revision_dir = get_generation_dirs(context)["revision"]
+
+        prompt = json.loads(prompt_text_qwen_image_edit)
+
+        NODES = {
+            'sampler': "1",
+            'save_image': "5",
+            'model_sampler': "6", # ModelSamplingAuraFlow
+            'cfg_norm': "7", # CFGNorm
+            'vae_encode': "8",
+            'pos_prompt': "12",
+            'neg_prompt': "11",
+            'unet_loader': "13",
+            'guidance_map_loader': "14", # Image 1 (structure)
+            'style_map_loader': "15",   # Image 2 (style)
+            'context_render_loader': "16", # Image 3 (context render)
+        }
+
+        # --- Build LoRA chain ---
+        initial_model_input = [NODES['unet_loader'], 0]
+        dummy_clip_input = [NODES['unet_loader'], 0] 
+
+        is_nunchaku = context.scene.model_name.lower().endswith('.safetensors')
+        lora_class = "NunchakuQwenImageLoraLoader" if is_nunchaku else "LoraLoaderModelOnly"
+
+        prompt, final_lora_model_out, _ = self._build_lora_chain(
+            prompt, context,
+            initial_model_input, dummy_clip_input,
+            start_node_id=500, 
+            lora_class_type=lora_class 
+        )
+
+        prompt[NODES['model_sampler']]['inputs']['model'] = final_lora_model_out
+
+        # --- Configure Inputs ---
+        # Image 1: The current render (structure)
+        render_info = self.operator._get_uploaded_image_info(context, "inpaint", subtype="render", camera_id=camera_id)
+        if not render_info:
+            self.operator._error = f"Could not find or upload render for camera {camera_id}."
+            return {"error": "conn_failed"}
+        prompt[NODES['guidance_map_loader']]['inputs']['image'] = render_info['name']
+
+        # --- Configure Style Image (Image 2) ---
+        use_prev_ref = context.scene.qwen_refine_use_prev_ref
+        style_image_info = None
+        
+        if use_prev_ref and camera_id > 0:
+             # Use previous generated image
+             style_image_info = self.operator._get_uploaded_image_info(context, "generated", camera_id=camera_id - 1, material_id=self.operator._material_id)
+        
+        if style_image_info:
+            prompt[NODES['style_map_loader']]['inputs']['image'] = style_image_info['name']
+        else:
+            # Fallback to external style image if configured
+            if context.scene.qwen_use_external_style_image:
+                 style_image_info = self.operator._get_uploaded_image_info(context, "custom", filename=bpy.path.abspath(context.scene.qwen_external_style_image))
+                 if style_image_info:
+                     prompt[NODES['style_map_loader']]['inputs']['image'] = style_image_info['name']
+            
+            # If still no style image, remove Image 2 inputs
+            if not style_image_info:
+                del prompt[NODES['style_map_loader']]
+                del prompt[NODES['pos_prompt']]['inputs']['image2']
+                del prompt[NODES['neg_prompt']]['inputs']['image2']
+
+        # --- Configure Depth Map (Image 3) ---
+        use_depth = context.scene.qwen_refine_use_depth
+        depth_info = None
+        if use_depth:
+            depth_info = self.operator._get_uploaded_image_info(context, "controlnet", subtype="depth", camera_id=camera_id)
+        
+        if depth_info:
+            prompt[NODES['context_render_loader']]['inputs']['image'] = depth_info['name']
+        else:
+            # Remove Context Render (Image 3) if not used
+            del prompt[NODES['context_render_loader']]
+            del prompt[NODES['pos_prompt']]['inputs']['image3']
+            del prompt[NODES['neg_prompt']]['inputs']['image3']
+
+        # --- Prompt ---
+        user_prompt = context.scene.comfyui_prompt
+        final_prompt = f"Modify image1 to {user_prompt}"
+        if depth_info:
+            final_prompt += ". Use image3 as depth map reference."
+        
+        prompt[NODES['pos_prompt']]['inputs']['prompt'] = final_prompt
+        
+        # --- Save and Execute ---
+        self._save_prompt_to_file(prompt, revision_dir)
+        
+        ws = self._connect_to_websocket(server_address, client_id)
+        if ws is None:
+            return {"error": "conn_failed"}
+
+        images = None
+        try:
+            images = self._execute_prompt_and_get_images(ws, prompt, client_id, server_address, NODES)
+        finally:
+            if ws:
+                ws.close()
+
+        if images is None or isinstance(images, dict) and "error" in images:
+            return {"error": "conn_failed"}
+        
+        return images[NODES['save_image']][0]
+
     def generate_qwen_edit(self, context, camera_id=None):
         """Generates an image using the Qwen-Image-Edit workflow."""
         server_address = context.preferences.addons[__package__].preferences.server_address
@@ -328,6 +438,7 @@ class WorkflowManager:
                     "inputs": {
                         "upscale_method": "lanczos",
                         "megapixels": 1,
+                        "resolution_steps": 1,
                         "image": [NODES['style_map_loader'], 0]
                     },
                     "class_type": "ImageScaleToTotalPixels",

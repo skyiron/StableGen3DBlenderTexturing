@@ -32,7 +32,8 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
         """
         # Compute offsets based on recursion level
         if context.scene.refine_preserve:
-            x_offset = 1000 + level * 800 + last_node.location[0] + 200 if context.scene.early_priority else 1000 + level * 600 + last_node.location[0] + 200
+            last_node_x = last_node.location[0] if last_node else 0
+            x_offset = 1000 + level * 800 + last_node_x + 200 if context.scene.early_priority else 1000 + level * 600 + last_node_x + 200
         else:
             x_offset = 1000 + level * 800 if context.scene.early_priority else 1000 + level * 600
         y_offset = 0
@@ -49,7 +50,7 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                 links.new(last_node.outputs[0], final_mix.inputs["Color2"])
             # Create a compare node to drive the mix factor
             
-            if context.scene.generation_method == 'refine' and context.scene.refine_preserve:
+            if (context.scene.generation_method == 'refine' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine')) and context.scene.refine_preserve:
                 w_node = weight_nodes[0]
                 if isinstance(w_node, tuple):
                     angle_node, feather_node = w_node
@@ -95,7 +96,7 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                     # Fallback if not tuple (e.g. stop_index logic used LessThan node)
                     # If it's a sum of processed weights (from multi-camera recursion), we need to invert it
                     # to get the Mix Factor (1 - TotalVis)
-                    if context.scene.generation_method == 'refine' and context.scene.refine_preserve:
+                    if (context.scene.generation_method == 'refine' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine')) and context.scene.refine_preserve:
                         invert = nodes_collection.new("ShaderNodeMath")
                         invert.operation = 'SUBTRACT'
                         invert.location = (x_offset - 150, y_offset)
@@ -123,7 +124,7 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                  
             # Add a principle shader for the mixed color
             should_add_principled = True
-            if context.scene.generation_method == 'refine' and context.scene.refine_preserve:
+            if (context.scene.generation_method == 'refine' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine')) and context.scene.refine_preserve:
                 # Final principled is at last_node's output if it is BSDF
                 final_principled = last_node.outputs[0].links[0].to_node
                 if final_principled.type == 'BSDF_PRINCIPLED':
@@ -332,12 +333,12 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
 
         # Create the material
         to_switch = False
-        if context.scene.generation_method == "refine" and context.scene.refine_preserve and not context.scene.overwrite_material:
+        if (context.scene.generation_method == "refine" or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine')) and context.scene.refine_preserve and not context.scene.overwrite_material:
             # Copy active material
             mat = obj.active_material.copy()
             obj.data.materials.append(mat)
             to_switch = True
-        elif obj.active_material and (context.scene.overwrite_material or (context.scene.generation_method == "refine" and context.scene.refine_preserve) \
+        elif obj.active_material and (context.scene.overwrite_material or ((context.scene.generation_method == "refine" or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine')) and context.scene.refine_preserve) \
                                       or (context.scene.generation_method == 'sequential' and stop_index > 0) or context.scene.generation_mode == 'regenerate_selected'):
             # Use active material
             mat = obj.active_material
@@ -411,7 +412,7 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
             # Now we can continue to the next object
             continue
                         
-        elif not context.scene.refine_preserve or not context.scene.generation_method == 'refine':
+        elif not context.scene.refine_preserve or not (context.scene.generation_method == 'refine' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine')):
             # Clear existing nodes
             for node in nodes:
                 nodes.remove(node)
@@ -428,7 +429,7 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                 else:
                     previous_node = output.inputs[0].links[0].from_node
             
-        if not (context.scene.generation_method == 'refine' and context.scene.refine_preserve):
+        if not ((context.scene.generation_method == 'refine' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine')) and context.scene.refine_preserve):
             output = nodes.new("ShaderNodeOutputMaterial")
             output.location = (3000, 0)
         
@@ -505,7 +506,7 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
             scripts_to_connect = [script_angle]
             final_weight_node = None
 
-            if context.scene.generation_method == 'refine' and context.scene.refine_preserve:
+            if (context.scene.generation_method == 'refine' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine')) and context.scene.refine_preserve:
                 # Add Feather script
                 script_feather = nodes.new("ShaderNodeScript")
                 script_feather.location = (-400, (-800) * i - 200) # Offset slightly
@@ -591,7 +592,7 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
             length_nodes.append(length)
 
         # Build mix shader tree
-        if not context.scene.bake_texture and mat.name in processed_materials and context.scene.generation_method == 'refine' and context.scene.refine_preserve:
+        if not context.scene.bake_texture and mat.name in processed_materials and (context.scene.generation_method == 'refine' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine')) and context.scene.refine_preserve:
             # If we already processed this material, we don't need to rebuild the mix tree
             # But we still need to connect the nodes for the current object (done in the loop below)
             # We need to find the existing mix node to position the output node

@@ -520,7 +520,7 @@ class ComfyUIGenerate(bpy.types.Operator):
                     self._material_id = material_id
             # Check if there are enough UV map slots
             if not context.scene.bake_texture and context.scene.generation_method != 'uv_inpaint':
-                if not context.scene.overwrite_material or (context.scene.generation_method == 'refine' and context.scene.refine_preserve):
+                if not context.scene.overwrite_material or ((context.scene.generation_method == 'refine' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine')) and context.scene.refine_preserve):
                     if 8 - len(obj.data.uv_layers) < uv_slots_needed:
                         self.report({'ERROR'}, "Not enough UV map slots for all cameras.")
                         context.scene.generation_status = 'idle'
@@ -549,7 +549,7 @@ class ComfyUIGenerate(bpy.types.Operator):
                 if 8 - len(obj.data.uv_layers) < 1:
                     self.report({'ERROR'}, "Not enough UV map slots for baking. At least 1 slot is required.")
 
-        if not context.scene.overwrite_material or self._material_id == -1 or (context.scene.generation_method == 'refine' and context.scene.refine_preserve):
+        if not context.scene.overwrite_material or self._material_id == -1 or ((context.scene.generation_method == 'refine' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine')) and context.scene.refine_preserve):
             self._material_id += 1
 
         if context.scene.generation_method == 'sequential' and context.scene.sequential_custom_camera_order != "":
@@ -577,7 +577,7 @@ class ComfyUIGenerate(bpy.types.Operator):
 
         if context.scene.generation_mode == 'standard':
             # If there is depth controlnet unit
-            if any(unit["unit_type"] == "depth" for unit in controlnet_units) or (context.scene.use_flux_lora and context.scene.model_architecture == 'flux1') or (context.scene.model_architecture == 'qwen_image_edit' and context.scene.qwen_guidance_map_type == 'depth'):
+            if any(unit["unit_type"] == "depth" for unit in controlnet_units) or (context.scene.use_flux_lora and context.scene.model_architecture == 'flux1') or (context.scene.model_architecture == 'qwen_image_edit' and context.scene.qwen_guidance_map_type == 'depth') or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine' and context.scene.qwen_refine_use_depth):
                 if context.scene.generation_method != 'uv_inpaint':
                     # Export depth maps for each camera
                     for i, camera in enumerate(self._cameras):
@@ -622,7 +622,7 @@ class ComfyUIGenerate(bpy.types.Operator):
                     obj.hide_render = True
 
         # Refine mode preparation
-        if context.scene.generation_method == 'refine':
+        if context.scene.generation_method == 'refine' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine'):
             for i, camera in enumerate(self._cameras):
                 bpy.context.scene.camera = camera
                 export_emit_image(context, self._to_texture, camera_id=i)
@@ -909,6 +909,8 @@ class ComfyUIGenerate(bpy.types.Operator):
                             image = self.workflow_manager.refine_flux(context, controlnet_info=controlnet_info, render_info=render_info, ipadapter_ref_info=ipadapter_ref_info)
                         else:
                             image = self.workflow_manager.refine(context, controlnet_info=controlnet_info, render_info=render_info, ipadapter_ref_info=ipadapter_ref_info)
+                    elif context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine':
+                        image = self.workflow_manager.generate_qwen_refine(context, camera_id=camera_id)
                     elif context.scene.generation_method == 'uv_inpaint':
                         if context.scene.model_architecture == 'flux1':
                             image = self.workflow_manager.refine_flux(context, mask_info=mask_info, render_info=render_info)
@@ -1023,7 +1025,7 @@ class ComfyUIGenerate(bpy.types.Operator):
                 else: # steps == 0, skip generation
                     pass # No image generation needed
 
-                if context.scene.generation_method == 'separate' or context.scene.generation_method == 'refine' or context.scene.generation_method == 'sequential':
+                if context.scene.generation_method == 'separate' or context.scene.generation_method == 'refine' or context.scene.generation_method == 'sequential' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine'):
                     self._current_image += 1
                     self._threads_left -= 1
                     if self._threads_left > 0:

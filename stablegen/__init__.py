@@ -1343,6 +1343,29 @@ def register():
         default='sequential',
         update=update_parameters
     )
+    bpy.types.Scene.qwen_generation_method = bpy.props.EnumProperty(
+        name="Generation Mode",
+        description="Choose the mode for generating images with Qwen",
+        items=[
+            ('generate', 'Generate', 'Standard generation mode'),
+            ('refine', 'Refine', 'Refine existing image'),
+        ],
+        default='generate',
+        update=update_parameters
+    )
+
+    bpy.types.Scene.qwen_refine_use_prev_ref = bpy.props.BoolProperty(
+        name="Use Previous Refined View",
+        description="Use the previous modified/refined view output as a second image for reference (Image 2)",
+        default=False,
+        update=update_parameters
+    )
+    bpy.types.Scene.qwen_refine_use_depth = bpy.props.BoolProperty(
+        name="Use Depth Map",
+        description="Include depth map as an additional reference image (Image 3)",
+        default=False,
+        update=update_parameters
+    )
     bpy.types.Scene.refine_images = bpy.props.BoolProperty(
         name="Refine Images",
         description="Refine images after generation",
