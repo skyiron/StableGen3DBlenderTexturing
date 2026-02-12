@@ -138,7 +138,7 @@ def apply_uv_inpaint_texture(context, obj, baked_image_path):
         if not uv_layers or len(uv_layers) == 0:
             return None
         for uv_layer in uv_layers:
-            if not uv_layer.name.startswith("ProjectionUV"):
+            if not uv_layer.name.startswith("ProjectionUV") and uv_layer.name != "_SG_ProjectionBuffer":
                 return uv_layer.name
         return uv_layers.active.name
 
@@ -325,7 +325,7 @@ def flatten_projection_material_for_refine(context, obj, baked_image_path):
     # -------------------------------------------------------------------------
     uv_name = None
     for uv in obj.data.uv_layers:
-        if not uv.name.startswith("ProjectionUV"):
+        if not uv.name.startswith("ProjectionUV") and uv.name != "_SG_ProjectionBuffer":
             uv_name = uv.name
             break
 
@@ -1544,8 +1544,8 @@ def unwrap(obj, method, overlap_only):
 
         is_new = False
 
-        # If all UV maps are ProjectionUV, add new one
-        if all(["ProjectionUV" in uv.name for uv in obj.data.uv_layers]):
+        # If all UV maps are ProjectionUV or buffer, add new one
+        if all(["ProjectionUV" in uv.name or uv.name == "_SG_ProjectionBuffer" for uv in obj.data.uv_layers]):
             # Add a new UV map
             obj.data.uv_layers.new(name=f"BakeUV")
             is_new = True
@@ -1553,9 +1553,9 @@ def unwrap(obj, method, overlap_only):
             # Set it for rendering
             obj.data.uv_layers.active = obj.data.uv_layers[-1]
         else:
-            # Ensure the active UV is a non-ProjectionUV map
+            # Ensure the active UV is a non-ProjectionUV/buffer map
             for uv_layer in obj.data.uv_layers:
-                if "ProjectionUV" not in uv_layer.name:
+                if "ProjectionUV" not in uv_layer.name and uv_layer.name != "_SG_ProjectionBuffer":
                     obj.data.uv_layers.active = uv_layer
                     break
         
@@ -1664,9 +1664,9 @@ def bake_texture(context, obj, texture_resolution, suffix = "", view_transform =
         # Set the image node as the active bake target
         nodes.active = tex_image    
 
-        # Ensure the active UV is a non-ProjectionUV map for correct baking
+        # Ensure the active UV is a non-ProjectionUV/buffer map for correct baking
         for uv_layer in obj.data.uv_layers:
-            if "ProjectionUV" not in uv_layer.name:
+            if "ProjectionUV" not in uv_layer.name and uv_layer.name != "_SG_ProjectionBuffer":
                 obj.data.uv_layers.active = uv_layer
                 break
         

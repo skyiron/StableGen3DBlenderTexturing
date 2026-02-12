@@ -6,6 +6,34 @@ from .utils import get_last_material_index, get_file_path, get_dir_path
 from .render_tools import prepare_baking, bake_texture, unwrap
 from mathutils import Vector
 
+_SG_BUFFER_UV_NAME = "_SG_ProjectionBuffer"
+
+
+def _copy_uv_to_attribute(obj, uv_layer_name, attr_name):
+    """Copy UV data from a UV layer to a named FLOAT_VECTOR corner-domain attribute.
+    Uses FLOAT_VECTOR (3-component) instead of FLOAT2 so the attribute does NOT
+    appear in the UV Maps list (FLOAT2 + CORNER = UV map in Blender 3.5+).
+    """
+    uv_layer = obj.data.uv_layers.get(uv_layer_name)
+    if not uv_layer:
+        return
+    n = len(obj.data.loops)
+    uv_buf = [0.0] * (n * 2)
+    uv_layer.data.foreach_get("uv", uv_buf)
+    # Convert (u,v) pairs to (u,v,0) triples for FLOAT_VECTOR storage
+    vec_buf = [0.0] * (n * 3)
+    for i in range(n):
+        vec_buf[i * 3] = uv_buf[i * 2]
+        vec_buf[i * 3 + 1] = uv_buf[i * 2 + 1]
+        # vec_buf[i * 3 + 2] already 0.0
+    # Remove existing attribute if present
+    existing = obj.data.attributes.get(attr_name)
+    if existing:
+        obj.data.attributes.remove(existing)
+    attr = obj.data.attributes.new(name=attr_name, type='FLOAT_VECTOR', domain='CORNER')
+    attr.data.foreach_set("vector", vec_buf)
+    obj.data.update()
+
 
 def create_native_raycast_visibility(nodes, links, camera, geometry, context, i, mat_id, stop_index):
     """
@@ -758,24 +786,17 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                         print("Error: Cannot make object data single user. Exiting.")
                         return Exception("Cannot make object data single user. Exiting.")
 
-                # Add new UV map if not present (with same name)
-                # Check if "ProjectionUV" UV map already exists
-                uv_map = None
+                # Create or reuse a buffer UV map for the UV Project modifier
+                buffer_uv = obj.data.uv_layers.get(_SG_BUFFER_UV_NAME)
+                if not buffer_uv:
+                    buffer_uv = obj.data.uv_layers.new(name=_SG_BUFFER_UV_NAME)
 
-                if context.scene.overwrite_material and not context.scene.bake_texture:
-                    for uv in obj.data.uv_layers:
-                        if uv.name == f"ProjectionUV_{i}_{mat_id}":
-                            uv_map = uv
-                            break
-                        
-                # If the objects has no UV map and we are baking textures, create a new one
-                if not obj.data.uv_layers and context.scene.bake_texture:
+                # If the object has no UV map other than the buffer and we are baking, create one
+                non_buffer_uvs = [uv for uv in obj.data.uv_layers if uv.name != _SG_BUFFER_UV_NAME]
+                if not non_buffer_uvs and context.scene.bake_texture:
                     obj.data.uv_layers.new(name="BakeUV")
 
-                if not uv_map:
-                    uv_map = obj.data.uv_layers.new(name=f"ProjectionUV_{i}_{mat_id}")
-
-                # Add the UV Project Modifier if not present
+                # Add the UV Project Modifier
                 uv_project_mod = obj.modifiers.new(name="UVProject", type='UV_PROJECT')
 
                 # Assign the active camera to the UV Project modifier
@@ -784,12 +805,8 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
 
                 uv_project_mod.projectors[0].object = camera
 
-                # Set the UV map for the modifier
-                try:
-                    uv_project_mod.uv_layer = uv_map.name
-                except:
-                    # Throw custom exception: Not enough UV map slots
-                    raise Exception("Not enough UV map slots. Please remove some UV maps.")
+                # Set the buffer UV map for the modifier
+                uv_project_mod.uv_layer = buffer_uv.name
 
                 # Calculate and set the aspect ratio
                 render = context.scene.render
@@ -797,16 +814,21 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                 uv_project_mod.aspect_x = aspect_ratio if aspect_ratio > 1 else 1
                 uv_project_mod.aspect_y = 1 / aspect_ratio if aspect_ratio < 1 else 1
 
-                # Set the new UV map as active so the modifier writes to it
+                # Set the buffer UV as active so the modifier writes to it
                 # (Blender 5.0+ ignores uv_layer and writes to the active UV map)
-                obj.data.uv_layers.active = uv_map
+                obj.data.uv_layers.active = buffer_uv
 
                 # Apply the modifier
                 bpy.ops.object.modifier_apply(modifier=uv_project_mod.name)
 
-                # Restore active UV to the original map so subsequent baking
-                # doesn't accidentally target a ProjectionUV
+                # Copy buffer UV data to a named attribute (no UV slot limit)
+                attr_name = f"ProjectionUV_{i}_{mat_id}"
+                _copy_uv_to_attribute(obj, _SG_BUFFER_UV_NAME, attr_name)
+
+                # Restore active UV to the first non-buffer UV layer
                 original_uv_map = obj.data.uv_layers[0]
+                if original_uv_map.name == _SG_BUFFER_UV_NAME and len(obj.data.uv_layers) > 1:
+                    original_uv_map = obj.data.uv_layers[1]
                 obj.data.uv_layers.active = original_uv_map
 
                 # If we are running in sequential mode, we already have baked textures for i < stop_index
@@ -819,7 +841,16 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                     obj.select_set(True)
                 if i <= stop_index and (not context.scene.generation_method == 'sequential' or i == stop_index):
                     simple_project_bake(context, i, obj, mat_id)
-                obj.data.uv_layers.remove(obj.data.uv_layers[-1]) # Remove the last UV map
+                # Remove the projection attribute (data is now baked into texture)
+                attr = obj.data.attributes.get(f"ProjectionUV_{i}_{mat_id}")
+                if attr:
+                    obj.data.attributes.remove(attr)
+
+    # Clean up buffer UV map from all objects
+    for obj in to_project:
+        buffer_uv = obj.data.uv_layers.get(_SG_BUFFER_UV_NAME)
+        if buffer_uv:
+            obj.data.uv_layers.remove(buffer_uv)
 
     # Switch to Cycles (needed for Raycast shader node on all versions)
     context.scene.render.engine = 'CYCLES'
@@ -983,12 +1014,15 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
             tex_image.label = f"{i}-{mat_id}"
             tex_image_nodes.append(tex_image)
                 
-            # Add UV map node
-            uv_map_node = nodes.new("ShaderNodeUVMap")
+            # Add UV map / attribute node
             if not context.scene.bake_texture:
-                uv_map_node.uv_map = f"ProjectionUV_{i}_{mat_id}"
+                # Use ShaderNodeAttribute to read from the corner-domain attribute
+                uv_map_node = nodes.new("ShaderNodeAttribute")
+                uv_map_node.attribute_name = f"ProjectionUV_{i}_{mat_id}"
+                uv_map_node.attribute_type = 'GEOMETRY'
             else:
-                # Use the original UV map
+                # Baked textures use the original UV map
+                uv_map_node = nodes.new("ShaderNodeUVMap")
                 uv_map_node.uv_map = original_uv_map.name
             uv_map_node.location = (-200, -200 * (i+1))
             uv_map_nodes.append(uv_map_node)
@@ -1184,7 +1218,8 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
             uv_map_node = uv_map_nodes[i]
 
             # Connect UV → Texture (needed for both paths)
-            links.new(uv_map_node.outputs["UV"], tex_image.inputs["Vector"])
+            uv_output = "Vector" if uv_map_node.type == 'ATTRIBUTE' else "UV"
+            links.new(uv_map_node.outputs[uv_output], tex_image.inputs["Vector"])
 
             if not use_native_raycast:
                 # OSL path: connect subtract, normalize, script inputs, length
@@ -1265,9 +1300,10 @@ def simple_project_bake(context, camera_id, obj, mat_id):
     if image:
         tex_image.image = image
 
-    # Add UV map node
-    uv_map_node = nodes.new("ShaderNodeUVMap")
-    uv_map_node.uv_map = f"ProjectionUV_{camera_id}_{mat_id}"
+    # Add UV attribute node (reads from corner-domain attribute)
+    uv_map_node = nodes.new("ShaderNodeAttribute")
+    uv_map_node.attribute_name = f"ProjectionUV_{camera_id}_{mat_id}"
+    uv_map_node.attribute_type = 'GEOMETRY'
     
     # Add BSDF node
     bsdf = nodes.new("ShaderNodeBsdfPrincipled")
@@ -1275,7 +1311,7 @@ def simple_project_bake(context, camera_id, obj, mat_id):
 
     # Add output node
     output = nodes.new("ShaderNodeOutputMaterial")
-    links.new(uv_map_node.outputs["UV"], tex_image.inputs["Vector"])
+    links.new(uv_map_node.outputs["Vector"], tex_image.inputs["Vector"])
     # Connect the nodes
     if context.scene.apply_bsdf:
         links.new(tex_image.outputs["Color"], bsdf.inputs["Base Color"])

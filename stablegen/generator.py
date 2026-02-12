@@ -502,8 +502,6 @@ class ComfyUIGenerate(bpy.types.Operator):
         else:
             print(f"Regenerating images for {len(self._selected_camera_ids)} selected cameras")
 
-        uv_slots_needed = len(self._cameras)
-
         if context.scene.texture_objects == 'selected':
             self._to_texture = [obj for obj in bpy.context.selected_objects if obj.type == 'MESH']
             # If empty, cancel the operation
@@ -521,36 +519,15 @@ class ComfyUIGenerate(bpy.types.Operator):
                 material_id = get_last_material_index(obj)
                 if (material_id > self._material_id):
                     self._material_id = material_id
-            # Check if there are enough UV map slots
-            if not context.scene.bake_texture and context.scene.generation_method != 'uv_inpaint':
-                if not context.scene.overwrite_material or ((context.scene.generation_method == 'refine' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine')) and context.scene.refine_preserve):
-                    if 8 - len(obj.data.uv_layers) < uv_slots_needed:
-                        self.report({'ERROR'}, "Not enough UV map slots for all cameras.")
-                        context.scene.generation_status = 'idle'
-                        ComfyUIGenerate._is_running = False
-                        return {'CANCELLED'}
-                else: # Overwrite material is enabled
-                    uv_maps = set()
-                    mesh = obj.data
-                    uv_maps = [uv_layer.name for uv_layer in mesh.uv_layers]
-                    usable_maps = 0
-                    if self._material_id == -1:
-                        self._material_id = 0
-                    # Count only stablegen UV maps
-                    for uv_map in uv_maps:
-                        for i in range(uv_slots_needed):
-                            if uv_map == f"ProjectionUV_{i}_{self._material_id}":
-                                usable_maps += 1
-                    if 8 - len(obj.data.uv_layers) + usable_maps < uv_slots_needed:
-                            print(f"8 - {len(obj.data.uv_layers)} + {usable_maps} < {uv_slots_needed}")
-                            self.report({'ERROR'}, "Not enough UV map slots for all cameras.")
-                            context.scene.generation_status = 'idle'
-                            ComfyUIGenerate._is_running = False
-                            return {'CANCELLED'}
-                        
-            else: # Baking
-                if 8 - len(obj.data.uv_layers) < 1:
-                    self.report({'ERROR'}, "Not enough UV map slots for baking. At least 1 slot is required.")
+            # Check if there's room for the projection buffer UV map (only 1 slot needed)
+            # Projection UV data is stored as attributes (no slot limit), but we need
+            # 1 temporary buffer UV slot for the UV Project modifier
+            has_buffer = obj.data.uv_layers.get("_SG_ProjectionBuffer") is not None
+            if not has_buffer and len(obj.data.uv_layers) >= 8:
+                self.report({'ERROR'}, "Not enough UV map slots. Please remove at least 1 UV map to free a slot for the projection buffer.")
+                context.scene.generation_status = 'idle'
+                ComfyUIGenerate._is_running = False
+                return {'CANCELLED'}
 
         if not context.scene.overwrite_material or self._material_id == -1 or ((context.scene.generation_method == 'refine' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine')) and context.scene.refine_preserve):
             self._material_id += 1
