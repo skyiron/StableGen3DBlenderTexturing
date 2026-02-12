@@ -426,6 +426,7 @@ def configure_output_node_paths(node, directory, filename):
 
 	# 2. Set PNG format
 	node.format.file_format = "PNG"
+	node.format.color_depth = '8'  # Force 8-bit; Blender 5.x defaults to 16-bit
 
 	# 3. Configure directory/base path
 	if hasattr(node, "directory"):
