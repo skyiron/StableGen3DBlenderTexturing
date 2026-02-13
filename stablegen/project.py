@@ -3,7 +3,7 @@ import os
 from math import atan, tan, pi
 
 from .utils import get_last_material_index, get_file_path, get_dir_path
-from .render_tools import prepare_baking, bake_texture, unwrap
+from .render_tools import prepare_baking, bake_texture, unwrap, _get_camera_resolution
 from mathutils import Vector
 
 _SG_BUFFER_UV_NAME = "_SG_ProjectionBuffer"
@@ -79,15 +79,16 @@ def create_native_raycast_visibility(nodes, links, camera, geometry, context, i,
     # --- Camera FOV ---
     camera_fov_node = nodes.new("ShaderNodeValue")
     camera_fov_node.location = (-800, 200 + 300 * i)
+    cam_res_x, cam_res_y = _get_camera_resolution(camera, context.scene)
     fov = camera.data.angle_x
-    if context.scene.render.resolution_y > context.scene.render.resolution_x:
-        fov = 2 * atan(tan(fov / 2) * context.scene.render.resolution_x / context.scene.render.resolution_y)
+    if cam_res_y > cam_res_x:
+        fov = 2 * atan(tan(fov / 2) * cam_res_x / cam_res_y)
     camera_fov_node.outputs[0].default_value = fov
 
     # --- Camera aspect ratio ---
     camera_aspect_node = nodes.new("ShaderNodeValue")
     camera_aspect_node.location = (-800, 100 + 300 * i)
-    camera_aspect_node.outputs[0].default_value = context.scene.render.resolution_x / context.scene.render.resolution_y
+    camera_aspect_node.outputs[0].default_value = cam_res_x / cam_res_y
 
     # --- Camera direction (CombineXYZ) ---
     cam_dir_vec = camera.matrix_world.to_quaternion() @ Vector((0, 0, -1))
@@ -804,9 +805,9 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                 # Set the buffer UV map for the modifier
                 uv_project_mod.uv_layer = buffer_uv.name
 
-                # Calculate and set the aspect ratio
-                render = context.scene.render
-                aspect_ratio = render.resolution_x / render.resolution_y
+                # Calculate and set the aspect ratio (per-camera if available)
+                cam_res_x, cam_res_y = _get_camera_resolution(camera, context.scene)
+                aspect_ratio = cam_res_x / cam_res_y
                 uv_project_mod.aspect_x = aspect_ratio if aspect_ratio > 1 else 1
                 uv_project_mod.aspect_y = 1 / aspect_ratio if aspect_ratio < 1 else 1
 
@@ -1132,10 +1133,11 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                 # Add additional add node, which will contain camera's FOV in first default value, and camera's aspect ratio in second default value
                 camera_fov = nodes.new("ShaderNodeValue")
                 camera_fov.location = (-600, 200 + 300 * i)
+                cam_res_x, cam_res_y = _get_camera_resolution(camera, context.scene)
                 fov = camera.data.angle_x
                 # Correct the FOV for vertical aspect ratio
-                if context.scene.render.resolution_y > context.scene.render.resolution_x:
-                    fov = 2 * atan(tan(fov / 2) * context.scene.render.resolution_x / context.scene.render.resolution_y)
+                if cam_res_y > cam_res_x:
+                    fov = 2 * atan(tan(fov / 2) * cam_res_x / cam_res_y)
                 camera_fov.outputs[0].default_value = fov
                 camera_fov_nodes.append(camera_fov)
                 camera_aspect_ratio = nodes.new("ShaderNodeValue")
@@ -1157,7 +1159,7 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                 camera_up.inputs[2].default_value = (camera.matrix_world.to_quaternion() @ Vector((0, 1, 0))).z
                 camera_up_nodes.append(camera_up)
                 
-                camera_aspect_ratio.outputs[0].default_value = context.scene.render.resolution_x / context.scene.render.resolution_y
+                camera_aspect_ratio.outputs[0].default_value = cam_res_x / cam_res_y
                 camera_aspect_ratio_nodes.append(camera_aspect_ratio)
 
                 # Add combine XYZ node

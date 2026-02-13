@@ -229,6 +229,11 @@ class StableGenPanel(bpy.types.Panel):
         if width_mode == 'narrow':
             cam_tools_row = layout.row() 
         cam_tools_row.operator("object.collect_camera_prompts", text="Collect Camera Prompts", icon="FILE_TEXT")
+
+        cam_extra_row = layout.row(align=True)
+        cam_extra_row.operator("object.clone_camera", text="Clone Camera", icon="DUPLICATE")
+        cam_extra_row.operator("object.mirror_camera", text="Mirror", icon="MOD_MIRROR")
+        cam_extra_row.operator("object.toggle_camera_labels", text="Labels", icon="FONT_DATA")
         
 
         addon_prefs = context.preferences.addons[__package__].preferences

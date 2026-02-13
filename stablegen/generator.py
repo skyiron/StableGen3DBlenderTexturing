@@ -17,7 +17,7 @@ import colorsys
 from PIL import Image, ImageEnhance
 
 from .util.helpers import prompt_text, prompt_text_img2img, prompt_text_qwen_image_edit # pylint: disable=relative-beyond-top-level
-from .render_tools import export_emit_image, export_visibility, export_canny, bake_texture, prepare_baking, unwrap, export_render, export_viewport # pylint: disable=relative-beyond-top-level
+from .render_tools import export_emit_image, export_visibility, export_canny, bake_texture, prepare_baking, unwrap, export_render, export_viewport, _SGCameraResolution, _get_camera_resolution, _sg_restore_square_display, _sg_remove_crop_overlay, _sg_ensure_crop_overlay, _sg_hide_label_overlay, _sg_restore_label_overlay # pylint: disable=relative-beyond-top-level
 from .utils import get_last_material_index, get_generation_dirs, get_file_path, get_dir_path, remove_empty_dirs, get_compositor_node_tree, configure_output_node_paths, get_eevee_engine_id # pylint: disable=relative-beyond-top-level
 from .project import project_image, reinstate_compare_nodes # pylint: disable=relative-beyond-top-level
 from .workflows import WorkflowManager
@@ -493,6 +493,25 @@ class ComfyUIGenerate(bpy.types.Operator):
             return {'CANCELLED'}
         # Sort cameras by name
         self._cameras.sort(key=lambda x: x.name)
+
+        # Hide crop and label overlays during generation
+        _sg_remove_crop_overlay()
+        _sg_hide_label_overlay()
+
+        # Auto-rescale per-camera resolutions (if any cameras have sg_res_x/y)
+        if context.scene.auto_rescale:
+            for cam in self._cameras:
+                if "sg_res_x" in cam and "sg_res_y" in cam:
+                    crx, cry = int(cam["sg_res_x"]), int(cam["sg_res_y"])
+                    c_total = crx * cry
+                    if (c_total > upper_bound or c_total < lower_bound) or (crx % align_step != 0 or cry % align_step != 0):
+                        sf = (target_px / c_total) ** 0.5
+                        crx = int(crx * sf)
+                        cry = int(cry * sf)
+                        crx -= crx % align_step
+                        cry -= cry % align_step
+                        cam["sg_res_x"] = crx
+                        cam["sg_res_y"] = cry
         self._selected_camera_ids = [i for i, cam in enumerate(self._cameras) if cam in bpy.context.selected_objects] #TEST
         if len(self._selected_camera_ids) == 0:
             self._selected_camera_ids = list(range(len(self._cameras))) # All cameras selected if none are selected
@@ -576,7 +595,8 @@ class ComfyUIGenerate(bpy.types.Operator):
                     # Export depth maps for each camera
                     for i, camera in enumerate(self._cameras):
                         bpy.context.scene.camera = camera
-                        self.export_depthmap(context, camera_id=i)
+                        with _SGCameraResolution(context, camera):
+                            self.export_depthmap(context, camera_id=i)
                     if context.scene.generation_method == 'grid':
                         self.combine_maps(context, self._cameras, type="depth")
             # If there is canny controlnet unit
@@ -585,7 +605,8 @@ class ComfyUIGenerate(bpy.types.Operator):
                     # Export canny maps for each camera
                     for i, camera in enumerate(self._cameras):
                         bpy.context.scene.camera = camera
-                        export_canny(context, camera_id=i, low_threshold=context.scene.canny_threshold_low, high_threshold=context.scene.canny_threshold_high)
+                        with _SGCameraResolution(context, camera):
+                            export_canny(context, camera_id=i, low_threshold=context.scene.canny_threshold_low, high_threshold=context.scene.canny_threshold_high)
                     if context.scene.generation_method == 'grid':
                         self.combine_maps(context, self._cameras, type="canny")
             # If there is normal controlnet unit
@@ -594,7 +615,8 @@ class ComfyUIGenerate(bpy.types.Operator):
                     # Export normal maps for each camera
                     for i, camera in enumerate(self._cameras):
                         bpy.context.scene.camera = camera
-                        self.export_normal(context, camera_id=i)
+                        with _SGCameraResolution(context, camera):
+                            self.export_normal(context, camera_id=i)
                     if context.scene.generation_method == 'grid':
                         self.combine_maps(context, self._cameras, type="normal")
 
@@ -607,7 +629,8 @@ class ComfyUIGenerate(bpy.types.Operator):
                     for i, camera in enumerate(self._cameras):
                         bpy.context.scene.camera = camera
                         # Filename logic must match get_file_path: "render{camera_id}" -> "render{camera_id}0001.png"
-                        export_render(context, camera_id=i, output_dir=workbench_dir, filename=f"render{i}")
+                        with _SGCameraResolution(context, camera):
+                            export_render(context, camera_id=i, output_dir=workbench_dir, filename=f"render{i}")
                     if context.scene.generation_method == 'grid':
                         self.combine_maps(context, self._cameras, type="workbench")
             # If Qwen guidance using Viewport
@@ -618,7 +641,8 @@ class ComfyUIGenerate(bpy.types.Operator):
                     for i, camera in enumerate(self._cameras):
                         bpy.context.scene.camera = camera
                         # Filename logic must match get_file_path: "viewport{camera_id}.png"
-                        export_viewport(context, camera_id=i, output_dir=viewport_dir, filename=f"viewport{i}")
+                        with _SGCameraResolution(context, camera):
+                            export_viewport(context, camera_id=i, output_dir=viewport_dir, filename=f"viewport{i}")
                     if context.scene.generation_method == 'grid':
                         self.combine_maps(context, self._cameras, type="viewport")
 
@@ -643,7 +667,8 @@ class ComfyUIGenerate(bpy.types.Operator):
         if context.scene.generation_method in ('refine', 'local_edit') or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method in ('refine', 'local_edit')):
             for i, camera in enumerate(self._cameras):
                 bpy.context.scene.camera = camera
-                export_emit_image(context, self._to_texture, camera_id=i)
+                with _SGCameraResolution(context, camera):
+                    export_emit_image(context, self._to_texture, camera_id=i)
 
         # UV inpainting mode preparation
         if context.scene.generation_method == 'uv_inpaint':
@@ -776,9 +801,15 @@ class ComfyUIGenerate(bpy.types.Operator):
                         # Probably canceled by user, quietly return
                         context.scene.generation_status = 'idle'
                         self.report({'WARNING'}, "Generation cancelled.")
+                        _sg_restore_square_display(context.scene)
+                        _sg_ensure_crop_overlay()
+                        _sg_restore_label_overlay()
                         remove_empty_dirs(context)
                         return {'CANCELLED'}
                     self.report({'ERROR'}, self._error)
+                    _sg_restore_square_display(context.scene)
+                    _sg_ensure_crop_overlay()
+                    _sg_restore_label_overlay()
                     remove_empty_dirs(context)
                     context.scene.generation_status = 'idle'
                     return {'CANCELLED'}
@@ -814,6 +845,9 @@ class ComfyUIGenerate(bpy.types.Operator):
                     context.area.spaces.active.shading.type = 'RENDERED'
                 context.scene.display_settings.display_device = 'sRGB'
                 context.scene.view_settings.view_transform = 'Standard'
+                _sg_restore_square_display(context.scene)
+                _sg_ensure_crop_overlay()
+                _sg_restore_label_overlay()
                 context.scene.generation_status = 'idle'
                 # Clear output directories which are not needed anymore
                 addon_prefs = context.preferences.addons[__package__].preferences
@@ -876,6 +910,28 @@ class ComfyUIGenerate(bpy.types.Operator):
         self._error = None
         try:
             while self._threads_left > 0 and not context.scene.generation_mode == 'project_only':
+                # Swap scene resolution to per-camera values if stored.
+                # Must use a timer callback so the write happens on the
+                # main thread; writing RNA from a background thread would
+                # trigger DEG_id_tag_update on a NULL depsgraph and crash.
+                if camera_id is not None and camera_id < len(self._cameras):
+                    _cam = self._cameras[camera_id]
+                    _rx, _ry = _get_camera_resolution(_cam, context.scene)
+                    def _swap_resolution():
+                        try:
+                            context.scene.render.resolution_x = _rx
+                            context.scene.render.resolution_y = _ry
+                        except Exception as e:
+                            self._error = str(e)
+                            traceback.print_exc()
+                        self._wait_event.set()
+                        return None
+                    bpy.app.timers.register(_swap_resolution)
+                    self._wait_event.wait()
+                    self._wait_event.clear()
+                    if self._error:
+                        return
+
                 if context.scene.steps != 0 and not (context.scene.generation_mode == 'regenerate_selected' and camera_id not in self._selected_camera_ids):
                     # Prepare Image Info for Upload
                     controlnet_info = {}
@@ -949,14 +1005,22 @@ class ComfyUIGenerate(bpy.types.Operator):
                             def context_callback():
                                 try:
                                     # Export visibility mask and render for the current camera, we need to use a callback to be in the main thread
-                                    export_visibility(context, self._to_texture, camera_visibility=self._cameras[self._current_image - 1]) # Export mask for current view
-                                    if context.scene.model_architecture == 'qwen_image_edit': # export custom bg and fallback for Qwen image edit
-                                        fallback_color, background_color = self._get_qwen_context_colors(context)
-                                        export_emit_image(context, self._to_texture, camera_id=self._current_image, bg_color=background_color, fallback_color=fallback_color) # Export render for next view
-                                        self._dilate_qwen_context_fallback(context, self._current_image, fallback_color)
-                                    else:
-                                        # Use a gray (neutral) background and fallback for other architectures
-                                        export_emit_image(context, self._to_texture, camera_id=self._current_image, bg_color=(0.5, 0.5, 0.5), fallback_color=(0.5, 0.5, 0.5))
+                                    # Visibility is rendered from the *current* camera's viewpoint
+                                    # (export_visibility internally picks the next camera after _vis_cam),
+                                    # so use the current camera's resolution for the render.
+                                    _vis_cam = self._cameras[self._current_image - 1]
+                                    _cur_cam = self._cameras[self._current_image] if self._current_image < len(self._cameras) else _vis_cam
+                                    with _SGCameraResolution(context, _cur_cam):
+                                        export_visibility(context, self._to_texture, camera_visibility=_vis_cam) # Export mask for current view
+                                    _emit_cam = _cur_cam
+                                    with _SGCameraResolution(context, _emit_cam):
+                                        if context.scene.model_architecture == 'qwen_image_edit': # export custom bg and fallback for Qwen image edit
+                                            fallback_color, background_color = self._get_qwen_context_colors(context)
+                                            export_emit_image(context, self._to_texture, camera_id=self._current_image, bg_color=background_color, fallback_color=fallback_color) # Export render for next view
+                                            self._dilate_qwen_context_fallback(context, self._current_image, fallback_color)
+                                        else:
+                                            # Use a gray (neutral) background and fallback for other architectures
+                                            export_emit_image(context, self._to_texture, camera_id=self._current_image, bg_color=(0.5, 0.5, 0.5), fallback_color=(0.5, 0.5, 0.5))
                                 except Exception as e:
                                     self._error = str(e)
                                     traceback.print_exc()

@@ -9,6 +9,8 @@ import mathutils
 from mathutils import Matrix
 import blf
 from .utils import get_file_path, get_dir_path, remove_empty_dirs, get_compositor_node_tree, configure_output_node_paths, get_eevee_engine_id
+import gpu
+from gpu_extras.batch import batch_for_shader
 import tempfile
 import shutil
 from PIL import Image
@@ -1112,24 +1114,1021 @@ def export_visibility(context, to_export, obj=None, camera_visibility=None):
 
     return True
 
+
+# =========================================================
+# Camera Placement Helper Functions
+# =========================================================
+
+def _fibonacci_sphere_points(n):
+    """Generate *n* approximately evenly-spaced unit vectors on a sphere
+    using a Fibonacci spiral.  Returns list of (x, y, z) tuples."""
+    points = []
+    golden_ratio = (1 + math.sqrt(5)) / 2
+    for i in range(n):
+        theta = math.acos(1 - 2 * (i + 0.5) / n)
+        phi = 2 * math.pi * i / golden_ratio
+        x = math.sin(theta) * math.cos(phi)
+        y = math.sin(theta) * math.sin(phi)
+        z = math.cos(theta)
+        points.append((x, y, z))
+    return points
+
+
+def _gather_target_meshes(context):
+    """Return a list of mesh objects to cover.
+    - If any selected objects are meshes, use those.
+    - Otherwise, use ALL mesh objects in the scene.
+    """
+    selected = [o for o in context.selected_objects if o.type == 'MESH']
+    if selected:
+        return selected
+    return [o for o in context.scene.objects if o.type == 'MESH']
+
+
+def _get_mesh_face_data(objs):
+    """Return world-space face (normals, areas, centers) as numpy arrays.
+    *objs* can be a single object or a list of mesh objects."""
+    if not isinstance(objs, (list, tuple)):
+        objs = [objs]
+    all_normals, all_areas, all_centers = [], [], []
+    for obj in objs:
+        mesh = obj.data
+        mat = obj.matrix_world
+        rot = mat.to_3x3()
+        scale_det = abs(rot.determinant())
+        n = len(mesh.polygons)
+        normals = np.empty((n, 3))
+        areas = np.empty(n)
+        centers = np.empty((n, 3))
+        for idx, poly in enumerate(mesh.polygons):
+            wn = rot @ poly.normal
+            wn.normalize()
+            normals[idx] = (wn.x, wn.y, wn.z)
+            wc = mat @ poly.center
+            centers[idx] = (wc.x, wc.y, wc.z)
+            areas[idx] = poly.area * (scale_det ** 0.5)
+        all_normals.append(normals)
+        all_areas.append(areas)
+        all_centers.append(centers)
+    return np.vstack(all_normals), np.concatenate(all_areas), np.vstack(all_centers)
+
+
+def _filter_bottom_faces(normals, areas, centers, angle_rad):
+    """Remove faces whose normals point more than *angle_rad* below the
+    horizon (negative-Z).  Returns filtered (normals, areas, centers).
+
+    *angle_rad* = 80° (≈1.40 rad) removes faces whose normal is > 80° below
+    horizontal, i.e. nearly straight down.  The Z-component threshold is
+    ``-cos(angle_rad)``."""
+    threshold_z = -math.cos(angle_rad)
+    mask = normals[:, 2] >= threshold_z  # keep faces *above* the threshold
+    return normals[mask], areas[mask], centers[mask]
+
+
+def _get_mesh_verts_world(objs):
+    """Return world-space vertex positions as (N, 3) numpy array.
+    *objs* can be a single object or a list of mesh objects."""
+    if not isinstance(objs, (list, tuple)):
+        objs = [objs]
+    parts = []
+    for obj in objs:
+        mesh = obj.data
+        mat = obj.matrix_world
+        n = len(mesh.vertices)
+        verts = np.empty((n, 3))
+        for i, v in enumerate(mesh.vertices):
+            wv = mat @ v.co
+            verts[i] = (wv.x, wv.y, wv.z)
+        parts.append(verts)
+    return np.vstack(parts)
+
+
+def _camera_basis(cam_dir_np):
+    """Build an orthonormal camera basis from a centre-to-camera direction.
+
+    Returns ``(right, up, d_unit)`` where
+    * *right*   – camera local X (numpy unit vector)
+    * *up*      – camera local Y (numpy unit vector)
+    * *d_unit*  – normalised centre-to-camera direction (camera local Z)
+
+    When the direction is nearly vertical the world-up fallback switches
+    from Z to Y, giving a deterministic orientation that avoids
+    ``to_track_quat`` gimbal degeneracy.
+    """
+    d = cam_dir_np / np.linalg.norm(cam_dir_np)
+    forward = -d
+    world_up = np.array([0.0, 0.0, 1.0])
+    if abs(np.dot(d, world_up)) > 0.99:
+        world_up = np.array([0.0, 1.0, 0.0])
+    right = np.cross(forward, world_up)
+    right /= np.linalg.norm(right)
+    up = np.cross(right, forward)
+    up /= np.linalg.norm(up)
+    return right, up, d
+
+
+def _rotation_from_basis(right, up, d_unit):
+    """Build a Blender rotation (Euler) from camera basis vectors.
+
+    The resulting rotation aligns the camera's local axes:
+    * local  X → *right*
+    * local  Y → *up*
+    * local  Z → *d_unit*   (away from mesh; -Z is the look direction)
+    """
+    rot_mat = mathutils.Matrix((
+        (right[0], up[0], d_unit[0]),
+        (right[1], up[1], d_unit[1]),
+        (right[2], up[2], d_unit[2]),
+    ))
+    return rot_mat.to_euler()
+
+
+def _compute_silhouette_distance(verts_world, center_np, cam_dir_np, fov_x, fov_y, margin=0.10):
+    """Compute the optimal distance along *cam_dir_np* so every mesh vertex
+    fits inside the camera frame with *margin* breathing room.
+
+    Uses a perspective-correct formula so objects with depth along the
+    viewing direction are never clipped.
+
+    Returns ``(distance, aim_offset)`` where *aim_offset* is a 3-element numpy
+    vector that shifts from *center_np* to the visual center of the silhouette.
+    The caller should aim the camera at ``center_np + aim_offset`` and place
+    it at ``center_np + aim_offset + direction * distance``.
+    """
+    right, up, d = _camera_basis(cam_dir_np)
+    forward = -d
+
+    # Project every vertex onto the camera's right / up plane
+    rel = verts_world - center_np
+    proj_r = rel @ right
+    proj_u = rel @ up
+
+    r_min, r_max = float(proj_r.min()), float(proj_r.max())
+    u_min, u_max = float(proj_u.min()), float(proj_u.max())
+
+    # Visual centre of the silhouette (midpoint of extents)
+    mid_r = (r_max + r_min) / 2.0
+    mid_u = (u_max + u_min) / 2.0
+
+    # Aim offset: shifts from mesh center to silhouette visual centre
+    aim_offset = mid_r * right + mid_u * up
+
+    eff_fov_x = fov_x * (1.0 - margin)
+    eff_fov_y = fov_y * (1.0 - margin)
+
+    tan_hx = math.tan(eff_fov_x / 2) if eff_fov_x > 0.02 else 1e-6
+    tan_hy = math.tan(eff_fov_y / 2) if eff_fov_y > 0.02 else 1e-6
+
+    # Perspective-correct distance: for each vertex the minimum camera
+    # distance along the view direction is  |lateral| / tan(half_fov) - depth
+    # where depth is signed distance from the aim point along the view ray.
+    aim_point = center_np + aim_offset
+    rel_aim = verts_world - aim_point
+    pr = rel_aim @ right
+    pu = rel_aim @ up
+    # Depth: positive = in front of aim point (toward camera)
+    pd = rel_aim @ d  # dot with camera direction (away from mesh)
+
+    min_dist_r = np.abs(pr) / tan_hx + pd
+    min_dist_u = np.abs(pu) / tan_hy + pd
+
+    dist = max(float(min_dist_r.max()), float(min_dist_u.max()), 0.5)
+
+    # --- Refine aim_offset using perspective angular centre ---
+    # The orthographic midpoint doesn't account for perspective foreshortening.
+    # Compute where the visual centre actually is from the camera position and
+    # shift the aim to centre it, then recompute the distance.
+    cam_pos = aim_point + d * dist
+    rel_cam = verts_world - cam_pos
+    depth = -(rel_cam @ d)  # positive = in front of camera
+    depth = np.maximum(depth, 0.001)
+    ang_r = np.arctan2(rel_cam @ right, depth)
+    ang_u = np.arctan2(rel_cam @ up, depth)
+    ang_mid_r = (float(ang_r.max()) + float(ang_r.min())) / 2.0
+    ang_mid_u = (float(ang_u.max()) + float(ang_u.min())) / 2.0
+    # Convert angular offset to world-space shift (at the computed distance)
+    aim_offset = aim_offset + dist * math.tan(ang_mid_r) * right + dist * math.tan(ang_mid_u) * up
+
+    # Recompute distance with refined aim
+    aim_point = center_np + aim_offset
+    rel_aim = verts_world - aim_point
+    pr = rel_aim @ right
+    pu = rel_aim @ up
+    pd = rel_aim @ d
+    min_dist_r = np.abs(pr) / tan_hx + pd
+    min_dist_u = np.abs(pu) / tan_hy + pd
+    dist = max(float(min_dist_r.max()), float(min_dist_u.max()), 0.5)
+
+    return dist, aim_offset
+
+
+def _kmeans_on_sphere(directions, weights, k, max_iter=50):
+    """Spherical K-means: cluster unit vectors weighted by area.
+    Returns (k, 3) numpy array of cluster-centre unit vectors."""
+    n_pts = len(directions)
+    if n_pts == 0 or k == 0:
+        return np.zeros((max(k, 1), 3))
+    k = min(k, n_pts)
+    rng = np.random.default_rng(42)
+    probs = weights / weights.sum()
+    indices = rng.choice(n_pts, size=k, replace=False, p=probs)
+    centers = directions[indices].copy()
+    for _ in range(max_iter):
+        dots = directions @ centers.T
+        labels = np.argmax(dots, axis=1)
+        new_centers = np.zeros_like(centers)
+        for j in range(k):
+            mask = labels == j
+            if mask.any():
+                ws = (directions[mask] * weights[mask, np.newaxis]).sum(axis=0)
+                nrm = np.linalg.norm(ws)
+                new_centers[j] = ws / nrm if nrm > 0 else centers[j]
+            else:
+                new_centers[j] = centers[j]
+        if np.allclose(centers, new_centers, atol=1e-6):
+            break
+        centers = new_centers
+    return centers
+
+
+def _compute_pca_axes(verts):
+    """Return the 3 principal axes of a (N, 3) vertex array (rows of a
+    3x3 array, sorted by descending eigenvalue)."""
+    mean = verts.mean(axis=0)
+    centered = verts - mean
+    cov = np.cov(centered.T)
+    eigenvalues, eigenvectors = np.linalg.eigh(cov)
+    idx = np.argsort(eigenvalues)[::-1]
+    return eigenvectors[:, idx].T  # rows = principal axes
+
+
+def _greedy_coverage_directions(normals, areas, max_cameras=12,
+                                coverage_target=0.95, n_candidates=200):
+    """Greedy set-cover: iteratively pick the camera direction that adds the
+    most newly-visible surface area (back-face culling only, no occlusion,
+    for speed).  Returns (selected_directions, final_coverage_fraction)."""
+    total_area = areas.sum()
+    if total_area <= 0:
+        return [], 0.0
+
+    candidates = np.array(_fibonacci_sphere_points(n_candidates))
+
+    # visibility[i, j] = True if face i faces toward candidate j
+    # cos(75°) ≈ 0.26 – ignore near-grazing faces that won't texture well
+    visibility = normals @ candidates.T > 0.26  # (n_faces, n_candidates)
+
+    covered = np.zeros(len(areas), dtype=bool)
+    selected = []
+
+    for _ in range(max_cameras):
+        uncovered = ~covered
+        # Vectorised: for each candidate sum the area of faces that are
+        # both visible from it AND not yet covered
+        new_vis = visibility & uncovered[:, np.newaxis]  # broadcast
+        new_areas = (new_vis * areas[:, np.newaxis]).sum(axis=0)
+
+        best_idx = int(np.argmax(new_areas))
+        if new_areas[best_idx] < total_area * 0.005:   # < 0.5 % new coverage
+            break
+
+        selected.append(candidates[best_idx].copy())
+        covered |= visibility[:, best_idx]
+
+        coverage = float(areas[covered].sum() / total_area)
+        if coverage >= coverage_target:
+            break
+
+    final_coverage = float(areas[covered].sum() / total_area) if covered.any() else 0.0
+    return selected, final_coverage
+
+
+# ──────────────────────────────────────────────────────────────────────
+# BVH occlusion helpers
+# ──────────────────────────────────────────────────────────────────────
+
+def _build_bvh_trees(objs, depsgraph):
+    """Build a list of BVHTree objects (one per mesh) for raycasting.
+
+    Returns
+    -------
+    list[mathutils.bvhtree.BVHTree]
+        One BVH per object, in world space.
+    """
+    from mathutils.bvhtree import BVHTree
+    trees = []
+    for obj in objs:
+        bm = bmesh.new()
+        bm.from_object(obj, depsgraph)
+        bm.transform(obj.matrix_world)
+        tree = BVHTree.FromBMesh(bm)
+        bm.free()
+        trees.append(tree)
+    return trees
+
+
+def _ray_occluded(bvh_trees, origin, direction, max_dist):
+    """Return True if *any* BVH tree has a hit between *origin* and
+    *origin + direction * max_dist* (exclusive of the starting face).
+
+    *origin* should already be slightly offset along the face normal to avoid
+    self-intersection.
+    """
+    for tree in bvh_trees:
+        hit_loc, _normal, _index, _dist = tree.ray_cast(
+            mathutils.Vector(origin), mathutils.Vector(direction), max_dist)
+        if hit_loc is not None:
+            return True
+    return False
+
+
+def _greedy_select_from_visibility(vis, areas, max_cameras, coverage_target,
+                                   candidates):
+    """Run greedy set-cover on a pre-computed visibility matrix.
+
+    Parameters
+    ----------
+    vis : ndarray (n_faces, n_candidates), bool
+    areas : ndarray (n_faces,)
+    max_cameras : int
+    coverage_target : float
+    candidates : ndarray (n_candidates, 3)
+
+    Returns
+    -------
+    (selected_directions, final_coverage)
+    """
+    total_area = areas.sum()
+    if total_area <= 0:
+        return [], 0.0
+
+    covered = np.zeros(len(areas), dtype=bool)
+    selected = []
+
+    for _ in range(max_cameras):
+        uncovered = ~covered
+        new_vis = vis & uncovered[:, np.newaxis]
+        new_areas = (new_vis * areas[:, np.newaxis]).sum(axis=0)
+
+        best_idx = int(np.argmax(new_areas))
+        if new_areas[best_idx] < total_area * 0.005:
+            break
+
+        selected.append(candidates[best_idx].copy())
+        covered |= vis[:, best_idx]
+
+        coverage = float(areas[covered].sum() / total_area)
+        if coverage >= coverage_target:
+            break
+
+    final_cov = float(areas[covered].sum() / total_area) if covered.any() else 0.0
+    return selected, final_cov
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Occlusion generators (modal-friendly, yield progress)
+# ──────────────────────────────────────────────────────────────────────
+
+def _occ_filter_faces_generator(normals, areas, centers, bvh_trees,
+                                n_candidates=200):
+    """Generator: determine which faces are visible from at least one
+    camera direction (exterior faces).
+
+    Yields progress floats in [0, 1].  Final result (via
+    ``StopIteration.value``) is a boolean mask ``(n_faces,)`` where True
+    means the face is visible from at least one direction.
+
+    Uses early-exit per face: as soon as one unoccluded direction is found,
+    the face is marked exterior and skipped for remaining candidates.
+    """
+    n_faces = len(normals)
+    candidates = np.array(_fibonacci_sphere_points(n_candidates))
+    backface_vis = normals @ candidates.T > 0.26  # (F, C)
+    exterior = np.zeros(n_faces, dtype=bool)
+    epsilon = 0.001
+    BATCH = 5
+
+    for j in range(n_candidates):
+        cam_dir = candidates[j]
+        for i in range(n_faces):
+            if exterior[i]:
+                continue  # already proven exterior
+            if not backface_vis[i, j]:
+                continue
+            origin = centers[i] + normals[i] * epsilon
+            if not _ray_occluded(bvh_trees, origin, cam_dir, 1e6):
+                exterior[i] = True
+        if (j + 1) % BATCH == 0 or j == n_candidates - 1:
+            yield (j + 1) / n_candidates
+            # Early termination: all faces proven exterior
+            if exterior.all():
+                break
+
+    return exterior
+
+
+def _occ_fom_generator(normals, areas, centers, bvh_trees,
+                       max_cameras, coverage_target, n_candidates=200):
+    """Generator: Full Occlusion Matrix approach.
+
+    Yields progress floats in [0, 1].  Final result is available via
+    ``StopIteration.value`` as ``(directions, coverage)``.
+    """
+    total_area = areas.sum()
+    if total_area <= 0:
+        yield 1.0
+        return [], 0.0
+
+    candidates = np.array(_fibonacci_sphere_points(n_candidates))
+    backface_vis = normals @ candidates.T > 0.26
+    n_faces = len(normals)
+    vis = np.zeros((n_faces, n_candidates), dtype=bool)
+    epsilon = 0.001
+    BATCH = 5
+
+    for j in range(n_candidates):
+        cam_dir = candidates[j]
+        for i in range(n_faces):
+            if not backface_vis[i, j]:
+                continue
+            origin = centers[i] + normals[i] * epsilon
+            if not _ray_occluded(bvh_trees, origin, cam_dir, 1e6):
+                vis[i, j] = True
+        if (j + 1) % BATCH == 0 or j == n_candidates - 1:
+            yield (j + 1) / n_candidates
+
+    return _greedy_select_from_visibility(
+        vis, areas, max_cameras, coverage_target, candidates)
+
+
+def _occ_tpr_generator(normals, areas, centers, bvh_trees,
+                       max_cameras, coverage_target, n_candidates=200):
+    """Generator: Two-Pass Refinement approach.
+
+    Yields progress floats in [0, 1].  Final result is available via
+    ``StopIteration.value`` as ``(directions, coverage)``.
+    """
+    total_area = areas.sum()
+    if total_area <= 0:
+        yield 1.0
+        return [], 0.0
+
+    candidates = np.array(_fibonacci_sphere_points(n_candidates))
+    backface_vis = normals @ candidates.T > 0.26
+
+    # ── Pass 1: fast greedy (back-face only, instant) ─────────────────
+    covered_bf = np.zeros(len(areas), dtype=bool)
+    selected_indices = []
+
+    for _ in range(max_cameras):
+        uncov = ~covered_bf
+        new_vis = backface_vis & uncov[:, np.newaxis]
+        new_areas_arr = (new_vis * areas[:, np.newaxis]).sum(axis=0)
+        best = int(np.argmax(new_areas_arr))
+        if new_areas_arr[best] < total_area * 0.005:
+            break
+        selected_indices.append(best)
+        covered_bf |= backface_vis[:, best]
+        if float(areas[covered_bf].sum() / total_area) >= coverage_target:
+            break
+
+    if not selected_indices:
+        yield 1.0
+        return [], 0.0
+
+    yield 0.0  # pass-1 done
+
+    # ── Phase 2a: BVH validate selected set (0 % → 30 %) ─────────────
+    epsilon = 0.001
+    true_covered = np.zeros(len(areas), dtype=bool)
+    n_sel = len(selected_indices)
+    for idx, ci in enumerate(selected_indices):
+        cam_dir = candidates[ci]
+        for fi in range(len(normals)):
+            if not backface_vis[fi, ci]:
+                continue
+            origin = centers[fi] + normals[fi] * epsilon
+            if not _ray_occluded(bvh_trees, origin, cam_dir, 1e6):
+                true_covered[fi] = True
+        yield 0.3 * (idx + 1) / n_sel
+
+    # ── Phase 2b: patch phantom-uncovered faces (30 % → 100 %) ───────
+    phantom_uncovered = covered_bf & ~true_covered
+
+    if phantom_uncovered.any():
+        remaining_budget = max_cameras - len(selected_indices)
+        if remaining_budget > 0:
+            used_set = set(selected_indices)
+            unused_mask = np.array([i not in used_set
+                                    for i in range(n_candidates)])
+            unused_indices = np.where(unused_mask)[0]
+
+            if len(unused_indices) > 0:
+                phantom_indices = np.where(phantom_uncovered)[0]
+                ph_normals = normals[phantom_indices]
+                ph_centers = centers[phantom_indices]
+                ph_areas = areas[phantom_indices]
+                ph_bf = ph_normals @ candidates[unused_indices].T > 0.26
+
+                ph_vis = np.zeros_like(ph_bf)
+                n_unused = len(unused_indices)
+                BATCH = 5
+                for j_local, j_global in enumerate(unused_indices):
+                    cam_dir = candidates[j_global]
+                    for i_local in range(len(phantom_indices)):
+                        if not ph_bf[i_local, j_local]:
+                            continue
+                        origin = (ph_centers[i_local]
+                                  + ph_normals[i_local] * epsilon)
+                        if not _ray_occluded(bvh_trees, origin,
+                                             cam_dir, 1e6):
+                            ph_vis[i_local, j_local] = True
+                    if (j_local + 1) % BATCH == 0 or j_local == n_unused - 1:
+                        yield 0.3 + 0.7 * (j_local + 1) / n_unused
+
+                # Greedy on sub-matrix (instant)
+                ph_covered = np.zeros(len(ph_areas), dtype=bool)
+                for _ in range(remaining_budget):
+                    uncov = ~ph_covered
+                    nv = ph_vis & uncov[:, np.newaxis]
+                    na = (nv * ph_areas[:, np.newaxis]).sum(axis=0)
+                    best_local = int(np.argmax(na))
+                    if na[best_local] < total_area * 0.005:
+                        break
+                    best_global = int(unused_indices[best_local])
+                    selected_indices.append(best_global)
+                    ph_covered |= ph_vis[:, best_local]
+                    for i_local in range(len(phantom_indices)):
+                        if ph_vis[i_local, best_local]:
+                            true_covered[phantom_indices[i_local]] = True
+
+    yield 1.0  # ensure caller sees 100 %
+    selected = [candidates[ci].copy() for ci in selected_indices]
+    final_cov = (float(areas[true_covered].sum() / total_area)
+                 if true_covered.any() else 0.0)
+    return selected, final_cov
+
+
+def _sort_directions_spatially(directions, ref_direction=None):
+    """Sort direction vectors by azimuth angle so cameras progress smoothly
+    around the subject.  The camera whose azimuth is closest to
+    *ref_direction* (typically the viewport look direction) becomes the first
+    entry.  Important for sequential generation mode where each camera needs
+    spatial context from the previous one."""
+    if len(directions) <= 1:
+        return directions
+    # Azimuth = atan2(y, x) gives a smooth circular ordering
+    angles = [math.atan2(float(d[1]), float(d[0])) for d in directions]
+    paired = sorted(zip(angles, directions), key=lambda p: p[0])
+
+    if ref_direction is not None:
+        # Use full 3D angular distance (dot product) so elevation is
+        # considered when choosing the start camera, not just azimuth.
+        ref_v = mathutils.Vector(ref_direction).normalized()
+        best_idx = 0
+        best_dot = -2.0
+        for idx, (_, d) in enumerate(paired):
+            dot = mathutils.Vector(d).normalized().dot(ref_v)
+            if dot > best_dot:
+                best_dot = dot
+                best_idx = idx
+        # Rotate so closest-to-ref is first
+        paired = paired[best_idx:] + paired[:best_idx]
+
+    return [d for _, d in paired]
+
+
+def _classify_camera_direction(cam_dir_np, ref_front_np):
+    """Classify a camera direction into a human-readable view label.
+
+    Uses Option-B scheme: elevation tiers first (top/bottom if >60°),
+    then 4 azimuth quadrants (front/right/left/rear, 90° each),
+    with 'from above'/'from below' modifiers for 30–60° elevation.
+
+    Parameters
+    ----------
+    cam_dir_np : array-like, shape (3,)
+        Centre-to-camera unit vector (where the camera is placed relative to
+        the mesh centre).
+    ref_front_np : array-like, shape (3,)
+        The reference "front" direction (centre-to-camera direction that
+        corresponds to the user's viewport, i.e. Camera_0's neighbourhood).
+
+    Returns
+    -------
+    str
+        A prompt-friendly label such as ``"front view"``,
+        ``"right side view, from above"``, ``"top view"``, etc.
+    """
+    d = np.array(cam_dir_np, dtype=float)
+    d /= max(np.linalg.norm(d), 1e-12)
+
+    # --- Elevation (angle above / below the horizontal XY plane) ---
+    elevation_rad = math.asin(np.clip(d[2], -1.0, 1.0))
+    elevation_deg = math.degrees(elevation_rad)
+
+    if elevation_deg > 60.0:
+        return "top view"
+    if elevation_deg < -60.0:
+        return "bottom view"
+
+    # --- Azimuth relative to ref_front (projected onto XY plane) ---
+    ref = np.array(ref_front_np, dtype=float)
+    # Project both onto XY
+    d_h = np.array([d[0], d[1]], dtype=float)
+    r_h = np.array([ref[0], ref[1]], dtype=float)
+    d_h_len = np.linalg.norm(d_h)
+    r_h_len = np.linalg.norm(r_h)
+    if d_h_len < 1e-8 or r_h_len < 1e-8:
+        # Nearly vertical – should have been caught by the elevation check,
+        # but fall back just in case.
+        return "top view" if d[2] >= 0 else "bottom view"
+    d_h /= d_h_len
+    r_h /= r_h_len
+
+    # Signed angle: positive = counterclockwise from above = to the user's right
+    sin_a = r_h[0] * d_h[1] - r_h[1] * d_h[0]
+    cos_a = r_h[0] * d_h[0] + r_h[1] * d_h[1]
+    azimuth_deg = math.degrees(math.atan2(sin_a, cos_a))
+
+    # Quadrant classification (each 90°)
+    abs_az = abs(azimuth_deg)
+    if abs_az <= 45.0:
+        base = "front view"
+    elif abs_az >= 135.0:
+        base = "rear view"
+    elif azimuth_deg > 0:
+        base = "right side view"
+    else:
+        base = "left side view"
+
+    # Elevation modifier
+    if elevation_deg > 30.0:
+        return f"{base}, from above"
+    if elevation_deg < -30.0:
+        return f"{base}, from below"
+    return base
+
+
+def _compute_per_camera_aspect(direction_np, verts_world, center):
+    """Compute the silhouette aspect ratio (width / height) from a single
+    camera direction.  Returns the aspect ratio as a float."""
+    right, up, _d = _camera_basis(direction_np)
+    rel = verts_world - center
+    proj_r = rel @ right
+    proj_u = rel @ up
+    w = max(float(proj_r.max() - proj_r.min()), 0.001)
+    h = max(float(proj_u.max() - proj_u.min()), 0.001)
+    return w / h
+
+
+def _perspective_aspect(verts_world, cam_pos_np, cam_dir_np):
+    """Compute the visible angular aspect ratio (width / height) as seen
+    from a perspective camera at *cam_pos_np* looking along *cam_dir_np*."""
+    right, up, d = _camera_basis(cam_dir_np)
+    forward = -d
+
+    rel = verts_world - cam_pos_np
+    depth = rel @ forward  # positive = in front of camera
+    depth = np.maximum(depth, 0.001)
+    pr = rel @ right
+    pu = rel @ up
+
+    angle_r = np.arctan2(pr, depth)
+    angle_u = np.arctan2(pu, depth)
+
+    angular_w = float(angle_r.max() - angle_r.min())
+    angular_h = float(angle_u.max() - angle_u.min())
+    if angular_h < 0.001:
+        return 1.0
+    return angular_w / angular_h
+
+
+def _resolution_from_aspect(aspect, total_px, align=8):
+    """Compute (res_x, res_y) for a given *aspect* ratio (w/h) keeping
+    approximately *total_px* pixels, snapped to *align*."""
+    new_x = math.sqrt(total_px * aspect)
+    new_y = total_px / new_x
+    new_x = max(align, int(round(new_x / align)) * align)
+    new_y = max(align, int(round(new_y / align)) * align)
+    return new_x, new_y
+
+
+def _apply_auto_aspect(directions_np, context, verts_world):
+    """Adjust scene render resolution to match the mesh's average apparent
+    aspect ratio across the given camera *directions_np*.  This is the
+    'shared' mode — all cameras use the same resolution.
+    Keeps total pixel count approximately constant and snaps to 8 px.
+    Returns (new_res_x, new_res_y)."""
+    center = verts_world.mean(axis=0)
+    aspects = [_compute_per_camera_aspect(d, verts_world, center)
+               for d in directions_np]
+    avg_aspect = float(np.mean(aspects))
+
+    render = context.scene.render
+    total_px = render.resolution_x * render.resolution_y
+    new_x, new_y = _resolution_from_aspect(avg_aspect, total_px)
+    render.resolution_x = new_x
+    render.resolution_y = new_y
+    return new_x, new_y
+
+
+def _store_per_camera_resolution(cam_obj, res_x, res_y):
+    """Store per-camera resolution as custom properties on the camera object."""
+    cam_obj["sg_res_x"] = res_x
+    cam_obj["sg_res_y"] = res_y
+
+
+def _get_camera_resolution(cam_obj, scene):
+    """Return (res_x, res_y) for a camera.  Falls back to scene render
+    resolution if no per-camera resolution is stored."""
+    if "sg_res_x" in cam_obj and "sg_res_y" in cam_obj:
+        return int(cam_obj["sg_res_x"]), int(cam_obj["sg_res_y"])
+    return scene.render.resolution_x, scene.render.resolution_y
+
+
+class _SGCameraResolution:
+    """Context manager: temporarily set scene render resolution to a camera's
+    per-camera values (if stored), and restore the original on exit.
+
+    Usage::
+
+        with _SGCameraResolution(context, camera_obj):
+            bpy.ops.render.render(write_still=True)
+    """
+    def __init__(self, context, cam_obj):
+        self._render = context.scene.render
+        self._cam = cam_obj
+        self._scene = context.scene
+        self._orig_x = self._render.resolution_x
+        self._orig_y = self._render.resolution_y
+
+    def __enter__(self):
+        rx, ry = _get_camera_resolution(self._cam, self._scene)
+        self._render.resolution_x = rx
+        self._render.resolution_y = ry
+        return self
+
+    def __exit__(self, *exc):
+        self._render.resolution_x = self._orig_x
+        self._render.resolution_y = self._orig_y
+        return False
+
+
+# ---- Per-camera crop overlay (GPU draw handler) -------------------------
+
+_sg_crop_draw_handle = None
+
+
+def _sg_draw_crop_overlays():
+    """SpaceView3D draw callback: renders a coloured rectangle inside each
+    camera's pyramid to visualise the actual (non-square) crop region."""
+    context = bpy.context
+    scene = context.scene
+
+    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+
+    for obj in scene.objects:
+        if obj.type != 'CAMERA' or 'sg_display_crop' not in obj:
+            continue
+        res_x = obj.get('sg_res_x', 0)
+        res_y = obj.get('sg_res_y', 0)
+        if res_x <= 0 or res_y <= 0:
+            continue
+
+        cam = obj.data
+        # Use whichever side of THIS camera is longer as the reference.
+        # The scene is set to a square of max_side, so the frustum is square
+        # and each side = half_w = half_h.  The crop rectangle occupies
+        # res_x/cam_max × res_y/cam_max of that square.
+        cam_max = max(res_x, res_y)
+
+        frame = cam.view_frame(scene=scene)
+        corner = frame[0]
+        half_w = abs(corner[0])
+        half_h = abs(corner[1])
+        z_depth = corner[2]
+        if half_w < 1e-8 or half_h < 1e-8:
+            continue
+
+        sx = res_x / cam_max
+        sy = res_y / cam_max
+
+        new_hw = half_w * sx
+        new_hh = half_h * sy
+
+        crop_local = [
+            mathutils.Vector((+new_hw, +new_hh, z_depth)),
+            mathutils.Vector((-new_hw, +new_hh, z_depth)),
+            mathutils.Vector((-new_hw, -new_hh, z_depth)),
+            mathutils.Vector((+new_hw, -new_hh, z_depth)),
+        ]
+
+        wm = obj.matrix_world
+        world_pts = [wm @ v for v in crop_local]
+        coords = [(v.x, v.y, v.z) for v in world_pts]
+        indices = [(0, 1), (1, 2), (2, 3), (3, 0)]
+        batch = batch_for_shader(shader, 'LINES', {"pos": coords}, indices=indices)
+        shader.bind()
+        shader.uniform_float("color", (1.0, 0.55, 0.0, 0.9))
+        gpu.state.line_width_set(2.0)
+        gpu.state.blend_set('ALPHA')
+        batch.draw(shader)
+
+    gpu.state.blend_set('NONE')
+    gpu.state.line_width_set(1.0)
+
+
+# ---- Per-camera view-label overlay (GPU text handler) --------------------
+
+_sg_label_draw_handle = None
+_sg_labels_user_visible = True
+
+
+def _sg_draw_view_labels():
+    """SpaceView3D POST_PIXEL callback: draws full camera prompt text
+    (from ``scene.camera_prompts``) near each camera in the viewport."""
+    context = bpy.context
+    scene = context.scene
+    region = context.region
+    rv3d = context.region_data
+    if region is None or rv3d is None:
+        return
+
+    from bpy_extras.view3d_utils import location_3d_to_region_2d
+
+    font_id = 0
+    blf.size(font_id, 13)
+    blf.color(font_id, 1.0, 0.85, 0.35, 0.95)
+
+    # Build a lookup of camera name -> prompt text
+    prompt_lookup = {item.name: item.prompt for item in scene.camera_prompts
+                     if item.prompt}
+
+    for obj in scene.objects:
+        if obj.type != 'CAMERA':
+            continue
+        label = prompt_lookup.get(obj.name, '')
+        if not label:
+            continue
+        co_2d = location_3d_to_region_2d(region, rv3d, obj.location)
+        if co_2d is None:
+            continue
+        # Offset slightly below the camera marker
+        blf.position(font_id, co_2d.x - blf.dimensions(font_id, label)[0] * 0.5,
+                     co_2d.y - 20, 0)
+        gpu.state.blend_set('ALPHA')
+        blf.draw(font_id, label)
+
+    gpu.state.blend_set('NONE')
+
+
+def _sg_ensure_crop_overlay():
+    """Register the crop overlay draw handler if not already active."""
+    global _sg_crop_draw_handle
+    if _sg_crop_draw_handle is None:
+        _sg_crop_draw_handle = bpy.types.SpaceView3D.draw_handler_add(
+            _sg_draw_crop_overlays, (), 'WINDOW', 'POST_VIEW')
+
+
+def _sg_remove_crop_overlay():
+    """Remove the crop overlay draw handler if active."""
+    global _sg_crop_draw_handle
+    if _sg_crop_draw_handle is not None:
+        bpy.types.SpaceView3D.draw_handler_remove(_sg_crop_draw_handle, 'WINDOW')
+        _sg_crop_draw_handle = None
+
+
+def _sg_ensure_label_overlay():
+    """Register the floating prompt-text label overlay if not already active."""
+    global _sg_label_draw_handle, _sg_labels_user_visible
+    _sg_labels_user_visible = True
+    if _sg_label_draw_handle is None:
+        _sg_label_draw_handle = bpy.types.SpaceView3D.draw_handler_add(
+            _sg_draw_view_labels, (), 'WINDOW', 'POST_PIXEL')
+        # Redraw all viewports so labels appear immediately
+        for area in (bpy.context.screen.areas if bpy.context.screen else []):
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+
+
+def _sg_remove_label_overlay():
+    """Remove the floating prompt-text label overlay if active."""
+    global _sg_label_draw_handle, _sg_labels_user_visible
+    _sg_labels_user_visible = False
+    if _sg_label_draw_handle is not None:
+        bpy.types.SpaceView3D.draw_handler_remove(_sg_label_draw_handle, 'WINDOW')
+        _sg_label_draw_handle = None
+        for area in (bpy.context.screen.areas if bpy.context.screen else []):
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+
+
+def _sg_hide_label_overlay():
+    """Temporarily hide the label overlay without changing the user's preference."""
+    global _sg_label_draw_handle
+    if _sg_label_draw_handle is not None:
+        bpy.types.SpaceView3D.draw_handler_remove(_sg_label_draw_handle, 'WINDOW')
+        _sg_label_draw_handle = None
+        for area in (bpy.context.screen.areas if bpy.context.screen else []):
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+
+
+def _sg_restore_label_overlay():
+    """Restore the label overlay only if the user had it enabled."""
+    if _sg_labels_user_visible:
+        global _sg_label_draw_handle
+        if _sg_label_draw_handle is None:
+            _sg_label_draw_handle = bpy.types.SpaceView3D.draw_handler_add(
+                _sg_draw_view_labels, (), 'WINDOW', 'POST_PIXEL')
+            for area in (bpy.context.screen.areas if bpy.context.screen else []):
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
+
+
+def _sg_restore_square_display(scene):
+    """Restore scene resolution to the max-side square and tag viewports
+    for redraw so crop overlays reappear correctly."""
+    cameras = [o for o in scene.objects if o.type == 'CAMERA' and 'sg_res_x' in o]
+    if not cameras:
+        return
+    max_side = max(
+        max(int(c.get('sg_res_x', 0)), int(c.get('sg_res_y', 0)))
+        for c in cameras
+    )
+    if max_side > 0:
+        scene.render.resolution_x = max_side
+        scene.render.resolution_y = max_side
+    # Refresh viewports
+    for area in bpy.context.screen.areas if bpy.context.screen else []:
+        if area.type == 'VIEW_3D':
+            area.tag_redraw()
+
+
+def _setup_square_camera_display(cam_obj, res_x, res_y):
+    """Mark a camera for the crop overlay and enable passepartout."""
+    cam_data = cam_obj.data
+    cam_data.show_passepartout = True
+    cam_data.passepartout_alpha = 0.5
+    cam_obj["sg_display_crop"] = True
+    # Ensure the draw handler is alive
+    _sg_ensure_crop_overlay()
+
+
+def _get_fov(cam_settings, context, res_x=None, res_y=None):
+    """Return (fov_x, fov_y) in radians for the given camera data block.
+    If *res_x* / *res_y* are not provided, reads from scene render settings."""
+    fov_x = cam_settings.angle_x
+    if res_x is None:
+        res_x = context.scene.render.resolution_x
+    if res_y is None:
+        res_y = context.scene.render.resolution_y
+    if res_y > res_x:
+        fov_x = 2 * math.atan(math.tan(fov_x / 2) * res_x / res_y)
+    fov_y = 2 * math.atan(math.tan(fov_x / 2) * res_y / res_x)
+    return fov_x, fov_y
+
+
 class AddCameras(bpy.types.Operator):
-    """Add cameras along a circle and adjust their positions
+    """Add cameras using various placement strategies and adjust their positions
     
-    Uses the active camera as a reference. If there is no active camera, a new one is created based on the viewport.
+    Uses the active camera as a reference for settings. If there is no active camera, a new one is created based on the viewport.
+    
+    Placement modes:
+    - Orbit Ring: cameras in a circle (inherits elevation from reference camera)
+    - Sphere Coverage: Fibonacci spiral for even sphere distribution
+    - Auto (Normal-Weighted): K-means clustering of mesh face normals
+    - Auto (PCA Axes): cameras along the mesh's principal component axes
+    - Auto (Greedy Coverage): iteratively adds cameras that maximise new visible surface area and auto-determines the count
+    - Fan from Camera: arc of cameras near the active camera
     
     Tips: 
     - Try to frame the object / scene with minimal margin around it.
-    - Aim to achieve a uniform coverage of the object / scene. 
+    - Aim to achieve a uniform coverage of the object / scene.
     - Areas not visible from any camera won't get textured. (Can still be UV-inpainted)
-    - Aspect ratio is set by Blender's output settings."""
+    - Aspect ratio is set by Blender's output settings (or auto-computed)."""
     bl_category = "ControlNet"
     bl_idname = "object.add_cameras"
     bl_label = "Add Cameras"
     bl_options = {'REGISTER', 'UNDO'}
 
+    placement_mode: bpy.props.EnumProperty(
+        name="Placement Mode",
+        description="Strategy for placing cameras around the subject",
+        items=[
+            ('orbit_ring', "Orbit Ring", "Place cameras in a circle around the center (original behaviour). Inherits elevation from the reference camera or viewport"),
+            ('hemisphere', "Sphere Coverage", "Distribute cameras evenly across a sphere using a Fibonacci spiral"),
+            ('normal_weighted', "Auto (Normal-Weighted)", "Automatically place cameras to cover the most surface area, using K-means on face normals weighted by area"),
+            ('pca_axes', "Auto (PCA Axes)", "Place cameras along the mesh's principal axes of variation"),
+            ('greedy_coverage', "Auto (Greedy Coverage)", "Iteratively add cameras that maximise new visible surface. Automatically determines the number of cameras needed"),
+            ('fan_from_camera', "Fan from Camera", "Spread cameras in an arc around the active camera's orbit position"),
+        ],
+        default='orbit_ring'
+    ) # type: ignore
+
     num_cameras: bpy.props.IntProperty(
         name="Number of Cameras",
-        description="Number of cameras to add (including reference camera if none exists)",
+        description="Number of cameras to add (not used by Greedy Coverage which auto-determines count)",
         default=4,
         min=1,
         max=100
@@ -1151,14 +2150,145 @@ class AddCameras(bpy.types.Operator):
         default=True
     ) # type: ignore
 
+    fan_angle: bpy.props.FloatProperty(
+        name="Fan Angle",
+        description="Total angular spread of the fan in degrees",
+        default=90.0,
+        min=10.0,
+        max=350.0
+    ) # type: ignore
+
+    coverage_target: bpy.props.FloatProperty(
+        name="Coverage Target",
+        description="Stop adding cameras when this fraction of surface area is visible (Greedy mode)",
+        default=0.95,
+        min=0.5,
+        max=1.0,
+        subtype='FACTOR'
+    ) # type: ignore
+
+    max_auto_cameras: bpy.props.IntProperty(
+        name="Max Cameras",
+        description="Upper limit on cameras for Greedy Coverage mode",
+        default=12,
+        min=2,
+        max=50
+    ) # type: ignore
+
+    auto_aspect: bpy.props.EnumProperty(
+        name="Auto Aspect Ratio",
+        description="Automatically adjust render aspect ratio to match the mesh silhouette",
+        items=[
+            ('off', "Off", "Use current scene resolution for all cameras"),
+            ('shared', "Shared", "Average silhouette aspect across all cameras and set a single scene resolution"),
+            ('per_camera', "Per Camera", "Each camera gets its own optimal aspect ratio (resolution is swapped during generation)"),
+        ],
+        default='per_camera'
+    ) # type: ignore
+
+    exclude_bottom: bpy.props.BoolProperty(
+        name="Exclude Bottom Faces",
+        description="Ignore downward-facing geometry (e.g. flat building undersides) when placing cameras",
+        default=True
+    ) # type: ignore
+
+    exclude_bottom_angle: bpy.props.FloatProperty(
+        name="Bottom Angle Threshold",
+        description="Faces whose normal points more than this many degrees below the horizon are excluded",
+        default=1.5533,  # 89 degrees in radians
+        min=0.1745,       # 10 degrees
+        max=1.5708,       # 90 degrees
+        subtype='ANGLE',
+        unit='ROTATION'
+    ) # type: ignore
+
+    auto_prompts: bpy.props.BoolProperty(
+        name="Auto View Prompts",
+        description="Automatically generate view-direction prompts (e.g. 'front view', 'rear view, from above') for each camera based on the viewport reference orientation",
+        default=False
+    ) # type: ignore
+
+    occlusion_mode: bpy.props.EnumProperty(
+        name="Occlusion Handling",
+        description="How to account for self-occlusion when choosing camera directions",
+        items=[
+            ('none', "None (Fast)",
+             "Back-face culling only – ignores self-occlusion. Fastest option"),
+            ('full_matrix', "Full Occlusion Matrix",
+             "Build a complete BVH-validated visibility matrix before greedy selection. Most accurate but slower"),
+            ('two_pass', "Two-Pass Refinement",
+             "Fast back-face pass, then targeted BVH refinement only for faces with zero true coverage"),
+        ],
+        default='none'
+    ) # type: ignore
+
     _timer = None
-    _last_time = 0.0
     _camera_index = 0
     _cameras = []
     _initial_camera = None
     _draw_handle = None
+    # Occlusion modal state
+    _occ_phase = False
+    _occ_gen = None
+    _occ_progress = 0.0
+    _occ_state = None
+
+    def draw(self, context):
+        """Custom dialog layout for the placement mode selector."""
+        layout = self.layout
+        layout.prop(self, "placement_mode")
+        layout.separator()
+        is_auto = self.placement_mode in ('hemisphere', 'normal_weighted', 'pca_axes', 'greedy_coverage')
+        if self.placement_mode == 'greedy_coverage':
+            layout.prop(self, "coverage_target")
+            layout.prop(self, "max_auto_cameras")
+        else:
+            layout.prop(self, "num_cameras")
+        if not is_auto:
+            layout.prop(self, "center_type")
+        if self.placement_mode == 'fan_from_camera':
+            layout.prop(self, "fan_angle")
+        if is_auto:
+            if self.placement_mode != 'hemisphere':
+                layout.prop(self, "occlusion_mode")
+            layout.prop(self, "auto_aspect")
+            layout.prop(self, "exclude_bottom")
+            if self.exclude_bottom:
+                layout.prop(self, "exclude_bottom_angle")
+            layout.prop(self, "auto_prompts")
+        layout.prop(self, "purge_others")
 
     def draw_callback(self, context):
+        # ── Occlusion progress display ───────────────────────────────────
+        if self._occ_phase:
+            font_id = 0
+            region = context.region
+            rw, rh = region.width, region.height
+            pct = self._occ_progress
+
+            # Progress bar background (dark)
+            bar_w, bar_h = 300, 18
+            bar_x = (rw - bar_w) / 2
+            bar_y = rh * 0.10
+
+            # Draw progress text above bar
+            msg = f"Computing occlusion… {pct * 100:.0f}%"
+            blf.size(font_id, 18)
+            tw, _th = blf.dimensions(font_id, msg)
+            blf.position(font_id, (rw - tw) / 2, bar_y + bar_h + 6, 0)
+            blf.color(font_id, 1.0, 0.85, 0.35, 0.95)
+            blf.draw(font_id, msg)
+
+            hint = "Press ESC to cancel"
+            blf.size(font_id, 13)
+            hw, _hh = blf.dimensions(font_id, hint)
+            blf.position(font_id, (rw - hw) / 2, bar_y - 18, 0)
+            blf.color(font_id, 0.7, 0.7, 0.7, 0.8)
+            blf.draw(font_id, hint)
+            blf.color(font_id, 1.0, 1.0, 1.0, 1.0)
+            return
+
+        # ── Fly-through HUD ──────────────────────────────────────────────
         try:
             count = len(self._cameras)
             idx = self._camera_index
@@ -1167,46 +2297,76 @@ class AddCameras(bpy.types.Operator):
         if count == 0:
             return
         font_id = 0
-        msg = f"Camera: {idx+1}/{count}  |  Press SPACE to confirm"
         region = context.region
         rw, rh = region.width, region.height
+
+        msg = f"Camera: {idx+1}/{count}  |  Press SPACE to confirm"
+        blf.size(font_id, 20)
         text_width, text_height = blf.dimensions(font_id, msg)
         x = (rw - text_width) / 2
         y = rh * 0.10
         blf.position(font_id, x, y, 0)
-        blf.size(20, 72)
         blf.draw(font_id, msg)
 
+        # Show auto-generated view label below the main HUD line
+        if idx < count:
+            cam_obj = self._cameras[idx]
+            view_label = cam_obj.get('sg_view_label', '')
+            if view_label:
+                blf.size(font_id, 16)
+                blf.color(font_id, 1.0, 0.85, 0.35, 0.95)
+                lw, _lh = blf.dimensions(font_id, view_label)
+                blf.position(font_id, (rw - lw) / 2, y - 28, 0)
+                blf.draw(font_id, view_label)
+                blf.color(font_id, 1.0, 1.0, 1.0, 1.0)
+
     def execute(self, context):
-        # delete other cameras if requested
+        # --- Delete other cameras if requested ---
         if self.purge_others:
             scene = context.scene
-            # gather all camera objects except the active/reference
             to_remove = [obj for obj in bpy.data.objects if obj.type == 'CAMERA' and obj != scene.camera]
             for cam in to_remove:
-                # unlink from all collections
                 for col in list(cam.users_collection):
                     col.objects.unlink(cam)
-                # remove the object
                 bpy.data.objects.remove(cam, do_unlink=True)
-            # also purge unused camera data
             for cam_data in list(bpy.data.cameras):
                 if not cam_data.users:
                     bpy.data.cameras.remove(cam_data)
 
+        # --- Validate mesh requirement for mesh-based modes ---
+        if self.placement_mode in ('hemisphere', 'normal_weighted', 'pca_axes', 'greedy_coverage'):
+            target_meshes = _gather_target_meshes(context)
+            if not target_meshes:
+                self.report({'ERROR'}, "No mesh objects found for this placement mode. Select meshes or ensure the scene has meshes.")
+                return {'CANCELLED'}
+            total_faces = sum(len(o.data.polygons) for o in target_meshes)
+            if total_faces == 0:
+                self.report({'ERROR'}, "Target meshes have no faces.")
+                return {'CANCELLED'}
+
+        # --- Fallback for center_type ---
         if self.center_type == 'object':
             obj = context.object
             if not obj:
                 self.report({'WARNING'}, "No active object found. Using view center instead.")
                 self.center_type = 'view center'
 
-        # add draw handler
+        # --- Add draw handler ---
         if AddCameras._draw_handle is None:
             AddCameras._draw_handle = bpy.types.SpaceView3D.draw_handler_add(
                 self.draw_callback, (context,), 'WINDOW', 'POST_PIXEL')
 
-        # determine center location
-        if self.center_type == 'object':
+        # --- Determine if this is a "manual" mode (needs ref camera for orbit)
+        #     or an "auto" mode (computes its own positions) ---
+        is_auto_mode = self.placement_mode in ('hemisphere', 'normal_weighted', 'pca_axes', 'greedy_coverage')
+
+        # --- Determine center location ---
+        # Auto modes compute their own center from mesh vertices later, so
+        # only the manual modes (orbit_ring, fan_from_camera) need this.
+        if is_auto_mode:
+            # Placeholder – auto branch overrides center_location from verts
+            center_location = context.region_data.view_location.copy()
+        elif self.center_type == 'object':
             obj = context.object
             cursor_loc = context.scene.cursor.location.copy()
             context.scene.cursor.location = obj.location.copy()
@@ -1218,10 +2378,11 @@ class AddCameras(bpy.types.Operator):
         else:
             center_location = context.region_data.view_location.copy()
 
-        # set or create reference camera
+        # --- Set or create reference camera ---
         self._initial_camera = context.scene.camera
         using_viewport_ref = False
-        if not self._initial_camera:
+        if not self._initial_camera and not is_auto_mode:
+            # Manual modes: create a camera from the viewport as Camera_0
             rv3d = context.region_data
             cam_data = bpy.data.cameras.new(name='Camera_0')
             cam_obj = bpy.data.objects.new('Camera_0', cam_data)
@@ -1231,23 +2392,289 @@ class AddCameras(bpy.types.Operator):
             self._initial_camera = cam_obj
             using_viewport_ref = True
 
-        # capture transform & settings
-        ref_mat = self._initial_camera.matrix_world.copy()
-        initial_pos = self._initial_camera.location.copy()
-        cam_settings = self._initial_camera.data
-
-        # how many around circle
-        total = self.num_cameras
-        count = total - 1 if using_viewport_ref else total
-
-        # compute circle
-        radius = (initial_pos - center_location).length
-        angle_initial = math.atan2(initial_pos.y - center_location.y, initial_pos.x - center_location.x)
-        angle_step = 2 * math.pi / (count + 1)
+        # --- Capture reference camera settings (for lens/sensor/clip copy) ---
+        cam_settings = self._initial_camera.data if self._initial_camera else None
 
         self._cameras.clear()
-        self._cameras.append(self._initial_camera)
         self._camera_index = 0
+
+        # --- Branch by placement mode ---
+        if self.placement_mode == 'orbit_ring':
+            ref_mat = self._initial_camera.matrix_world.copy()
+            initial_pos = self._initial_camera.location.copy()
+            radius = (initial_pos - center_location).length
+            if radius < 0.001:
+                radius = 5.0
+            self._cameras.append(self._initial_camera)
+            self._place_orbit_ring(context, center_location, ref_mat, initial_pos, cam_settings, radius, using_viewport_ref)
+        elif self.placement_mode == 'fan_from_camera':
+            ref_mat = self._initial_camera.matrix_world.copy()
+            initial_pos = self._initial_camera.location.copy()
+            radius = (initial_pos - center_location).length
+            if radius < 0.001:
+                radius = 5.0
+            self._cameras.append(self._initial_camera)
+            self._place_fan(context, center_location, ref_mat, initial_pos, cam_settings, radius, using_viewport_ref)
+        else:
+            # ============================================================
+            # Auto modes: per-camera optimal distance from mesh silhouette
+            # ============================================================
+            # target_meshes was validated above
+
+            # Borrow settings from existing camera or create temp defaults
+            temp_cam_data = None
+            if not cam_settings:
+                temp_cam_data = bpy.data.cameras.new(name='_sg_temp_cam')
+                cam_settings = temp_cam_data
+
+            # Pre-compute combined mesh data across all target meshes
+            verts_world = _get_mesh_verts_world(target_meshes)
+            mesh_center = verts_world.mean(axis=0)
+            center_location = mathutils.Vector(mesh_center.tolist())
+            mesh_names = ', '.join(o.name for o in target_meshes)
+            self.report({'INFO'}, f"Target meshes ({len(target_meshes)}): {mesh_names}")
+
+            # --- Determine directions ---
+            if self.placement_mode == 'greedy_coverage':
+                normals, areas, centers = _get_mesh_face_data(target_meshes)
+                if self.exclude_bottom:
+                    normals, areas, centers = _filter_bottom_faces(
+                        normals, areas, centers, self.exclude_bottom_angle)
+
+                occ = self.occlusion_mode
+                if occ == 'none':
+                    directions, coverage = _greedy_coverage_directions(
+                        normals, areas,
+                        max_cameras=self.max_auto_cameras,
+                        coverage_target=self.coverage_target)
+                    directions = [np.array(d) for d in directions]
+                    self.report({'INFO'},
+                        f"Greedy coverage (no occlusion): "
+                        f"{len(directions)} cameras, {coverage*100:.1f}% coverage")
+                else:
+                    # ── Async occlusion via modal ────────────────────────
+                    depsgraph = context.evaluated_depsgraph_get()
+                    bvh_trees = _build_bvh_trees(target_meshes, depsgraph)
+                    gen_func = (_occ_fom_generator if occ == 'full_matrix'
+                                else _occ_tpr_generator)
+                    self._occ_gen = gen_func(
+                        normals, areas, centers, bvh_trees,
+                        max_cameras=self.max_auto_cameras,
+                        coverage_target=self.coverage_target)
+                    self._occ_phase = True
+                    self._occ_progress = 0.0
+                    self._occ_state = {
+                        'result_type': 'greedy',
+                        'verts_world': verts_world,
+                        'mesh_center': mesh_center,
+                        'cam_settings': cam_settings,
+                        'temp_cam_data': temp_cam_data,
+                        'occ_label': ('full occlusion' if occ == 'full_matrix'
+                                      else 'two-pass'),
+                    }
+                    context.window_manager.modal_handler_add(self)
+                    self._timer = context.window_manager.event_timer_add(
+                        0.01, window=context.window)
+                    return {'RUNNING_MODAL'}
+            elif self.placement_mode == 'hemisphere':
+                points = _fibonacci_sphere_points(self.num_cameras)
+                directions = [np.array(p) for p in points]
+                if self.exclude_bottom:
+                    # Remove directions that point more than the threshold below the horizon
+                    threshold_z = -math.cos(self.exclude_bottom_angle)
+                    directions = [d for d in directions if d[2] >= threshold_z]
+            elif self.placement_mode == 'normal_weighted':
+                normals, areas, centers = _get_mesh_face_data(target_meshes)
+                if self.exclude_bottom:
+                    normals, areas, centers = _filter_bottom_faces(
+                        normals, areas, centers, self.exclude_bottom_angle)
+
+                occ = self.occlusion_mode
+                if occ != 'none':
+                    depsgraph = context.evaluated_depsgraph_get()
+                    bvh_trees = _build_bvh_trees(target_meshes, depsgraph)
+                    self._occ_gen = _occ_filter_faces_generator(
+                        normals, areas, centers, bvh_trees)
+                    self._occ_phase = True
+                    self._occ_progress = 0.0
+                    self._occ_state = {
+                        'result_type': 'filter_kmeans',
+                        'normals': normals,
+                        'areas': areas,
+                        'centers': centers,
+                        'num_cameras': self.num_cameras,
+                        'verts_world': verts_world,
+                        'mesh_center': mesh_center,
+                        'cam_settings': cam_settings,
+                        'temp_cam_data': temp_cam_data,
+                    }
+                    context.window_manager.modal_handler_add(self)
+                    self._timer = context.window_manager.event_timer_add(
+                        0.01, window=context.window)
+                    return {'RUNNING_MODAL'}
+                else:
+                    k = min(self.num_cameras, len(normals))
+                    cluster_dirs = _kmeans_on_sphere(normals, areas, k)
+                    directions = [cluster_dirs[i] for i in range(len(cluster_dirs))]
+            elif self.placement_mode == 'pca_axes':
+                normals, areas, centers = _get_mesh_face_data(target_meshes)
+                if self.exclude_bottom:
+                    normals, areas, centers = _filter_bottom_faces(
+                        normals, areas, centers, self.exclude_bottom_angle)
+
+                occ = self.occlusion_mode
+                if occ != 'none':
+                    depsgraph = context.evaluated_depsgraph_get()
+                    bvh_trees = _build_bvh_trees(target_meshes, depsgraph)
+                    self._occ_gen = _occ_filter_faces_generator(
+                        normals, areas, centers, bvh_trees)
+                    self._occ_phase = True
+                    self._occ_progress = 0.0
+                    self._occ_state = {
+                        'result_type': 'filter_pca',
+                        'normals': normals,
+                        'areas': areas,
+                        'centers': centers,
+                        'num_cameras': self.num_cameras,
+                        'exclude_bottom': self.exclude_bottom,
+                        'exclude_bottom_angle': self.exclude_bottom_angle,
+                        'verts_world': verts_world,
+                        'mesh_center': mesh_center,
+                        'cam_settings': cam_settings,
+                        'temp_cam_data': temp_cam_data,
+                    }
+                    context.window_manager.modal_handler_add(self)
+                    self._timer = context.window_manager.event_timer_add(
+                        0.01, window=context.window)
+                    return {'RUNNING_MODAL'}
+                else:
+                    axes = _compute_pca_axes(verts_world)
+                    directions = []
+                    for axis in axes:
+                        directions.append(axis)
+                        directions.append(-axis)
+                    if self.exclude_bottom:
+                        threshold_z = -math.cos(self.exclude_bottom_angle)
+                        directions = [d for d in directions if d[2] >= threshold_z]
+                    directions = directions[:min(self.num_cameras, len(directions))]
+
+            # Finalize: sort, aspect ratio, camera creation, auto prompts
+            self._finalize_auto_cameras(
+                context, directions, verts_world, mesh_center,
+                cam_settings, temp_cam_data)
+
+        # --- Start fly-through review ---
+        if not self._start_fly_review(context):
+            return {'CANCELLED'}
+        return {'RUNNING_MODAL'}
+
+    # -------------------------------------------------------
+    # Auto-mode finalization helpers
+    # -------------------------------------------------------
+
+    def _finalize_auto_cameras(self, context, directions, verts_world,
+                               mesh_center, cam_settings, temp_cam_data):
+        """Sort directions, compute aspect ratios, create cameras, and
+        generate auto prompts.  Shared by both the synchronous (no-occlusion)
+        and asynchronous (modal occlusion) code paths."""
+        ref_dir = None
+        if directions:
+            rv3d = context.region_data
+            if rv3d:
+                view_dir = rv3d.view_rotation @ mathutils.Vector((0, 0, -1))
+                ref_dir = np.array([-view_dir.x, -view_dir.y, -view_dir.z])
+            directions = _sort_directions_spatially(directions, ref_dir)
+
+        render = context.scene.render
+        total_px = render.resolution_x * render.resolution_y
+        center_np_for_aspect = verts_world.mean(axis=0)
+
+        if self.auto_aspect == 'shared' and directions:
+            dirs_np = [d / np.linalg.norm(d) for d in directions]
+            old_x, old_y = render.resolution_x, render.resolution_y
+            new_x, new_y = _apply_auto_aspect(dirs_np, context, verts_world)
+            if (new_x, new_y) != (old_x, old_y):
+                self.report({'INFO'},
+                    f"Aspect ratio adjusted: {old_x}x{old_y} → {new_x}x{new_y}")
+
+        if self.auto_aspect == 'per_camera' and directions:
+            self._create_cameras_per_aspect(
+                context, directions, mesh_center, verts_world,
+                cam_settings, total_px, center_np_for_aspect)
+        else:
+            fov_x, fov_y = _get_fov(cam_settings, context)
+            self._create_cameras_from_directions(
+                context, directions, mesh_center, verts_world,
+                cam_settings, fov_x, fov_y)
+
+        if temp_cam_data:
+            bpy.data.cameras.remove(temp_cam_data)
+
+        if self.auto_prompts and self._cameras:
+            ref_front = (ref_dir if ref_dir is not None
+                         else np.array([0.0, 1.0, 0.0]))
+            mesh_center_np = np.array(mesh_center, dtype=float)
+            for cam_obj in self._cameras:
+                cam_pos = np.array(cam_obj.location, dtype=float)
+                cam_dir = cam_pos - mesh_center_np
+                label = _classify_camera_direction(cam_dir, ref_front)
+                cam_obj["sg_view_label"] = label
+                prompt_item = next(
+                    (item for item in context.scene.camera_prompts
+                     if item.name == cam_obj.name), None)
+                if not prompt_item:
+                    prompt_item = context.scene.camera_prompts.add()
+                    prompt_item.name = cam_obj.name
+                prompt_item.prompt = label
+            context.scene.use_camera_prompts = True
+            self.report({'INFO'},
+                        f"Auto-prompts: assigned view labels to "
+                        f"{len(self._cameras)} cameras")
+
+    def _start_fly_review(self, context, add_modal_handler=True):
+        """Frame the first camera and start fly-through review.
+
+        *add_modal_handler* should be False when called from an already-running
+        modal (e.g. after occlusion computation finishes).
+        Returns True if fly-through started, False if no cameras were created.
+        """
+        if not self._cameras:
+            self.report({'WARNING'}, "No cameras were created.")
+            if AddCameras._draw_handle:
+                bpy.types.SpaceView3D.draw_handler_remove(
+                    AddCameras._draw_handle, 'WINDOW')
+                AddCameras._draw_handle = None
+            return False
+
+        rv3d = context.region_data
+        context.scene.camera = self._cameras[0]
+        if rv3d.view_perspective != 'CAMERA':
+            bpy.ops.view3d.view_camera()
+        bpy.ops.view3d.view_center_camera()
+        try:
+            rv3d.view_camera_zoom = 1.0
+        except Exception:
+            pass
+
+        _sg_hide_label_overlay()
+        if add_modal_handler:
+            context.window_manager.modal_handler_add(self)
+        self._timer = context.window_manager.event_timer_add(
+            0.5, window=context.window)
+        self._last_time = time.time()
+        bpy.ops.view3d.fly('INVOKE_DEFAULT')
+        return True
+
+    # -------------------------------------------------------
+    # Placement methods
+    # -------------------------------------------------------
+
+    def _place_orbit_ring(self, context, center_location, ref_mat, initial_pos, cam_settings, radius, using_viewport_ref):
+        """Place cameras in a circle (original AddCameras behaviour)."""
+        total = self.num_cameras
+        count = total - 1 if using_viewport_ref else total
+        angle_initial = math.atan2(initial_pos.y - center_location.y, initial_pos.x - center_location.x)
+        angle_step = 2 * math.pi / (count + 1)
 
         for i in range(count):
             angle = (i + 1) * angle_step + angle_initial
@@ -1268,34 +2695,263 @@ class AddCameras(bpy.types.Operator):
                 direction = center_location - cam_obj_new.location
                 rot = direction.to_track_quat('-Z', 'Y')
                 cam_obj_new.rotation_euler = rot.to_euler()
-            # copy settings
-            cam_obj_new.data.type = cam_settings.type
-            cam_obj_new.data.lens = cam_settings.lens
-            cam_obj_new.data.sensor_width = cam_settings.sensor_width
-            cam_obj_new.data.sensor_height = cam_settings.sensor_height
-            cam_obj_new.data.clip_start = cam_settings.clip_start
-            cam_obj_new.data.clip_end = cam_settings.clip_end
+            self._copy_camera_settings(cam_obj_new, cam_settings)
             self._cameras.append(cam_obj_new)
 
-        # frame camera in viewport
-        rv3d = context.region_data
-        context.scene.camera = self._cameras[0]
-        if rv3d.view_perspective != 'CAMERA':
-            bpy.ops.view3d.view_camera()
-        bpy.ops.view3d.view_center_camera()
-        try:
-            rv3d.view_camera_zoom = 1.0
-        except Exception:
-            pass
+    def _place_fan(self, context, center_location, ref_mat, initial_pos, cam_settings, radius, using_viewport_ref):
+        """Spread cameras in an arc around the active camera's position."""
+        fan_rad = math.radians(self.fan_angle)
+        angle_initial = math.atan2(initial_pos.y - center_location.y, initial_pos.x - center_location.x)
+        total = self.num_cameras
+        count = total - 1 if using_viewport_ref else total
+        if count <= 0:
+            return
+        for i in range(count):
+            if count == 1:
+                t = 0.0
+            else:
+                t = (i / (count - 1)) - 0.5  # range -0.5 .. 0.5
+            angle = angle_initial + t * fan_rad
+            cam_data_new = bpy.data.cameras.new(name=f'Camera_fan_{i}')
+            cam_obj_new = bpy.data.objects.new(f'Camera_fan_{i}', cam_data_new)
+            context.collection.objects.link(cam_obj_new)
+            if using_viewport_ref:
+                delta = t * fan_rad
+                T1 = Matrix.Translation(-center_location)
+                Rz = Matrix.Rotation(delta, 4, 'Z')
+                T2 = Matrix.Translation(center_location)
+                cam_obj_new.matrix_world = T2 @ Rz @ T1 @ ref_mat
+            else:
+                x = center_location.x + radius * math.cos(angle)
+                y = center_location.y + radius * math.sin(angle)
+                z = initial_pos.z
+                cam_obj_new.location = (x, y, z)
+                direction = center_location - cam_obj_new.location
+                rot = direction.to_track_quat('-Z', 'Y')
+                cam_obj_new.rotation_euler = rot.to_euler()
+            self._copy_camera_settings(cam_obj_new, cam_settings)
+            self._cameras.append(cam_obj_new)
 
-        # start fly nav
-        context.window_manager.modal_handler_add(self)
-        self._timer = context.window_manager.event_timer_add(0.5, window=context.window)
-        self._last_time = time.time()
-        bpy.ops.view3d.fly('INVOKE_DEFAULT')
-        return {'RUNNING_MODAL'}
+    def _create_cameras_from_directions(self, context, directions, center_np,
+                                         verts_world, cam_settings, fov_x, fov_y):
+        """Shared camera creation for all auto-placement modes.
+        Each camera gets its own optimal distance computed from the mesh's
+        silhouette extent in that viewing direction."""
+        center_vec = mathutils.Vector(center_np.tolist())
+        prefix_map = {
+            'hemisphere': 'Camera_sphere',
+            'normal_weighted': 'Camera_auto',
+            'pca_axes': 'Camera_pca',
+            'greedy_coverage': 'Camera',
+        }
+        prefix = prefix_map.get(self.placement_mode, 'Camera')
+
+        for i, d in enumerate(directions):
+            d_np = np.array(d, dtype=float)
+            dist, aim_off = _compute_silhouette_distance(verts_world, center_np, d_np, fov_x, fov_y)
+            dir_vec = mathutils.Vector(d_np.tolist()).normalized()
+            aim_point = center_vec + mathutils.Vector(aim_off.tolist())
+            pos = aim_point + dir_vec * dist
+
+            cam_data = bpy.data.cameras.new(name=f'{prefix}_{i}')
+            cam_obj = bpy.data.objects.new(f'{prefix}_{i}', cam_data)
+            context.collection.objects.link(cam_obj)
+            cam_obj.location = pos
+            right, up_v, d_unit = _camera_basis(d_np)
+            cam_obj.rotation_euler = _rotation_from_basis(right, up_v, d_unit)
+            self._copy_camera_settings(cam_obj, cam_settings)
+            self._cameras.append(cam_obj)
+
+    def _create_cameras_per_aspect(self, context, directions, center_np,
+                                    verts_world, cam_settings, total_px,
+                                    center_for_aspect):
+        """Create cameras with per-camera optimal aspect ratio and distance.
+        Uses an iterative refinement: first computes aspect from the
+        orthographic silhouette, then refines it using the actual perspective
+        projection from the computed camera position."""
+        center_vec = mathutils.Vector(center_np.tolist())
+        prefix_map = {
+            'hemisphere': 'Camera_sphere',
+            'normal_weighted': 'Camera_auto',
+            'pca_axes': 'Camera_pca',
+            'greedy_coverage': 'Camera',
+        }
+        prefix = prefix_map.get(self.placement_mode, 'Camera')
+
+        for i, d in enumerate(directions):
+            d_np = np.array(d, dtype=float)
+            d_unit = d_np / np.linalg.norm(d_np)
+
+            # --- Pass 1: orthographic aspect as initial estimate ---
+            aspect = _compute_per_camera_aspect(d_unit, verts_world, center_for_aspect)
+            res_x, res_y = _resolution_from_aspect(aspect, total_px)
+            fov_x, fov_y = _get_fov(cam_settings, context, res_x, res_y)
+            dist, aim_off = _compute_silhouette_distance(
+                verts_world, center_np, d_np, fov_x, fov_y)
+
+            # --- Pass 2: refine aspect from actual perspective camera pos ---
+            aim_point_np = center_np + aim_off
+            cam_pos_np = aim_point_np + d_unit * dist
+            aspect = _perspective_aspect(verts_world, cam_pos_np, d_np)
+            res_x, res_y = _resolution_from_aspect(aspect, total_px)
+            fov_x, fov_y = _get_fov(cam_settings, context, res_x, res_y)
+            dist, aim_off = _compute_silhouette_distance(
+                verts_world, center_np, d_np, fov_x, fov_y)
+
+            dir_vec = mathutils.Vector(d_np.tolist()).normalized()
+            aim_point = center_vec + mathutils.Vector(aim_off.tolist())
+            pos = aim_point + dir_vec * dist
+
+            cam_data = bpy.data.cameras.new(name=f'{prefix}_{i}')
+            cam_obj = bpy.data.objects.new(f'{prefix}_{i}', cam_data)
+            context.collection.objects.link(cam_obj)
+            cam_obj.location = pos
+            right, up_v, d_unit_cam = _camera_basis(d_np)
+            cam_obj.rotation_euler = _rotation_from_basis(right, up_v, d_unit_cam)
+            self._copy_camera_settings(cam_obj, cam_settings)
+
+            # Store per-camera resolution
+            _store_per_camera_resolution(cam_obj, res_x, res_y)
+            _setup_square_camera_display(cam_obj, res_x, res_y)
+            self._cameras.append(cam_obj)
+
+        # Set scene to square resolution (max side length) for viewport display
+        max_side = max(
+            max(int(c.get('sg_res_x', 0)), int(c.get('sg_res_y', 0)))
+            for c in self._cameras if 'sg_res_x' in c
+        ) if self._cameras else max(context.scene.render.resolution_x,
+                                     context.scene.render.resolution_y)
+        if max_side > 0:
+            context.scene.render.resolution_x = max_side
+            context.scene.render.resolution_y = max_side
+
+    @staticmethod
+    def _copy_camera_settings(cam_obj, cam_settings):
+        """Copy lens / sensor / clip settings from a reference camera data block."""
+        cam_obj.data.type = cam_settings.type
+        cam_obj.data.lens = cam_settings.lens
+        cam_obj.data.sensor_width = cam_settings.sensor_width
+        cam_obj.data.sensor_height = cam_settings.sensor_height
+        cam_obj.data.clip_start = cam_settings.clip_start
+        cam_obj.data.clip_end = cam_settings.clip_end
 
     def modal(self, context, event):
+        # ── Occlusion computation phase ──────────────────────────────────
+        if self._occ_phase:
+            if event.type in {'ESC', 'RIGHTMOUSE'}:
+                # Cancel occlusion computation
+                context.window_manager.event_timer_remove(self._timer)
+                self._timer = None
+                self._occ_gen = None
+                self._occ_phase = False
+                context.area.header_text_set(None)
+                if AddCameras._draw_handle:
+                    bpy.types.SpaceView3D.draw_handler_remove(
+                        AddCameras._draw_handle, 'WINDOW')
+                    AddCameras._draw_handle = None
+                # Clean up temp camera data stored in state
+                state = self._occ_state
+                if state and state.get('temp_cam_data'):
+                    bpy.data.cameras.remove(state['temp_cam_data'])
+                self._occ_state = None
+                self.report({'WARNING'}, "Occlusion computation cancelled.")
+                return {'CANCELLED'}
+
+            if event.type == 'TIMER':
+                try:
+                    progress = next(self._occ_gen)
+                    self._occ_progress = progress
+                    context.area.header_text_set(
+                        f"Computing occlusion visibility… "
+                        f"{progress * 100:.0f}%   (ESC to cancel)")
+                    # Force viewport redraw so the GPU overlay updates too
+                    for area in context.screen.areas:
+                        if area.type == 'VIEW_3D':
+                            area.tag_redraw()
+                except StopIteration as done:
+                    # Generator finished – retrieve result
+                    context.area.header_text_set(None)
+
+                    # Clean up occlusion timer
+                    context.window_manager.event_timer_remove(self._timer)
+                    self._timer = None
+                    self._occ_gen = None
+                    self._occ_phase = False
+
+                    state = self._occ_state
+                    result_type = state.get('result_type', 'greedy')
+
+                    if result_type == 'greedy':
+                        # Greedy occlusion: result is (directions, coverage)
+                        directions, coverage = done.value
+                        directions = [np.array(d) for d in directions]
+                        occ_label = state['occ_label']
+                        self.report({'INFO'},
+                            f"Greedy coverage ({occ_label}): "
+                            f"{len(directions)} cameras, "
+                            f"{coverage * 100:.1f}% coverage")
+                    elif result_type == 'filter_kmeans':
+                        # Face filter for K-means: result is exterior mask
+                        exterior = done.value
+                        normals = state['normals'][exterior]
+                        areas = state['areas'][exterior]
+                        n_removed = int((~exterior).sum())
+                        self.report({'INFO'},
+                            f"Occlusion filter: removed {n_removed} "
+                            f"interior faces, {len(normals)} remain")
+                        k = min(state['num_cameras'], len(normals))
+                        if k > 0 and len(normals) > 0:
+                            cluster_dirs = _kmeans_on_sphere(normals, areas, k)
+                            directions = [cluster_dirs[i]
+                                          for i in range(len(cluster_dirs))]
+                        else:
+                            directions = []
+                    elif result_type == 'filter_pca':
+                        # Face filter for PCA: result is exterior mask
+                        exterior = done.value
+                        # PCA uses filtered verts (only exterior faces)
+                        f_centers = state['centers'][exterior]
+                        n_removed = int((~exterior).sum())
+                        self.report({'INFO'},
+                            f"Occlusion filter: removed {n_removed} "
+                            f"interior faces, {len(f_centers)} remain")
+                        if len(f_centers) >= 3:
+                            axes = _compute_pca_axes(f_centers)
+                        else:
+                            axes = _compute_pca_axes(
+                                state['verts_world'])
+                        directions = []
+                        for axis in axes:
+                            directions.append(axis)
+                            directions.append(-axis)
+                        if state.get('exclude_bottom'):
+                            threshold_z = -math.cos(
+                                state['exclude_bottom_angle'])
+                            directions = [
+                                d for d in directions
+                                if d[2] >= threshold_z]
+                        directions = directions[
+                            :min(state['num_cameras'],
+                                 len(directions))]
+
+                    # Finalize cameras (sort, aspect, create, prompts)
+                    self._finalize_auto_cameras(
+                        context, directions,
+                        state['verts_world'], state['mesh_center'],
+                        state['cam_settings'], state['temp_cam_data'])
+                    self._occ_state = None
+
+                    # Transition to fly-through review
+                    if not self._start_fly_review(
+                            context, add_modal_handler=False):
+                        return {'CANCELLED'}
+                    # Stay in modal for the fly-through phase
+                return {'RUNNING_MODAL'}
+
+            # Let Blender process UI events during occlusion
+            return {'RUNNING_MODAL'}
+
+        # ── Fly-through review phase ─────────────────────────────────────
         if event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
             if time.time() - self._last_time < 0.2:
                 return {'RUNNING_MODAL'}
@@ -1311,7 +2967,13 @@ class AddCameras(bpy.types.Operator):
                     if AddCameras._draw_handle:
                         bpy.types.SpaceView3D.draw_handler_remove(AddCameras._draw_handle, 'WINDOW')
                         AddCameras._draw_handle = None
-                    context.scene.camera = self._initial_camera
+                    # Restore to initial camera, or first placed camera for auto modes
+                    if self._initial_camera and self._initial_camera.name in [o.name for o in context.scene.objects]:
+                        context.scene.camera = self._initial_camera
+                    elif self._cameras:
+                        context.scene.camera = self._cameras[0]
+                    # Enable the floating prompt labels now that review is over
+                    _sg_restore_label_overlay()
                     self.report({'INFO'}, "Cameras added successfully.")
                     return {'FINISHED'}
                 context.scene.camera = self._cameras[self._camera_index]
@@ -1358,6 +3020,174 @@ def switch_viewport_to_camera(context, camera):
                     area.tag_redraw()
                     break
             break 
+
+class CloneCamera(bpy.types.Operator):
+    """Create a new camera at the active camera's position and enter fly mode to reposition it.
+    
+    If no camera exists, one is created from the current viewport.
+    Useful for incrementally adding cameras one at a time."""
+    bl_idname = "object.clone_camera"
+    bl_label = "Clone Camera"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    _timer = None
+    _camera = None
+    _original_camera = None
+
+    @classmethod
+    def poll(cls, context):
+        for window in context.window_manager.windows:
+            for op in window.modal_operators:
+                if op.bl_idname in ('OBJECT_OT_test_stable', 'OBJECT_OT_collect_camera_prompts',
+                                    'OBJECT_OT_bake_textures', 'OBJECT_OT_add_cameras',
+                                    'OBJECT_OT_clone_camera'):
+                    return False
+        return True
+
+    def execute(self, context):
+        ref_cam = context.scene.camera
+        self._original_camera = ref_cam
+
+        if not ref_cam:
+            # Create from viewport
+            rv3d = context.region_data
+            cam_data = bpy.data.cameras.new(name='Camera_clone')
+            cam_obj = bpy.data.objects.new('Camera_clone', cam_data)
+            context.collection.objects.link(cam_obj)
+            cam_obj.matrix_world = rv3d.view_matrix.inverted()
+        else:
+            # Clone from active camera
+            cam_data = bpy.data.cameras.new(name=f'{ref_cam.name}_clone')
+            cam_obj = bpy.data.objects.new(cam_data.name, cam_data)
+            context.collection.objects.link(cam_obj)
+            cam_obj.matrix_world = ref_cam.matrix_world.copy()
+            cam_obj.data.type = ref_cam.data.type
+            cam_obj.data.lens = ref_cam.data.lens
+            cam_obj.data.sensor_width = ref_cam.data.sensor_width
+            cam_obj.data.sensor_height = ref_cam.data.sensor_height
+            cam_obj.data.clip_start = ref_cam.data.clip_start
+            cam_obj.data.clip_end = ref_cam.data.clip_end
+
+        self._camera = cam_obj
+        context.scene.camera = cam_obj
+
+        rv3d = context.region_data
+        if rv3d.view_perspective != 'CAMERA':
+            bpy.ops.view3d.view_camera()
+        bpy.ops.view3d.view_center_camera()
+        try:
+            rv3d.view_camera_zoom = 1.0
+        except Exception:
+            pass
+
+        context.window_manager.modal_handler_add(self)
+        self._timer = context.window_manager.event_timer_add(0.5, window=context.window)
+        bpy.ops.view3d.fly('INVOKE_DEFAULT')
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if event.type == 'TIMER':
+            fly_running = any(op.bl_idname == 'VIEW3D_OT_fly'
+                              for w in context.window_manager.windows
+                              for op in w.modal_operators)
+            if not fly_running:
+                context.window_manager.event_timer_remove(self._timer)
+                if self._original_camera:
+                    context.scene.camera = self._original_camera
+                self.report({'INFO'}, f"Camera cloned: {self._camera.name}")
+                return {'FINISHED'}
+            return {'PASS_THROUGH'}
+        return {'PASS_THROUGH'}
+
+
+class MirrorCamera(bpy.types.Operator):
+    """Create a mirror of the active camera across a chosen axis through the object/scene center.
+    
+    The new camera is placed symmetrically on the opposite side and oriented to look at the center."""
+    bl_idname = "object.mirror_camera"
+    bl_label = "Mirror Camera"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    mirror_axis: bpy.props.EnumProperty(
+        name="Mirror Axis",
+        description="Axis to mirror across",
+        items=[
+            ('X', "X Axis", "Mirror left / right"),
+            ('Y', "Y Axis", "Mirror front / back"),
+            ('Z', "Z Axis", "Mirror top / bottom"),
+        ],
+        default='X'
+    ) # type: ignore
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene.camera is not None
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        cam = context.scene.camera
+        obj = context.object
+
+        # Determine center point
+        if obj and obj.type == 'MESH':
+            center = obj.matrix_world.translation.copy()
+        else:
+            center = mathutils.Vector((0, 0, 0))
+
+        # Mirror position
+        pos = cam.location.copy()
+        axis_idx = 'XYZ'.index(self.mirror_axis)
+        delta = pos - center
+        delta[axis_idx] = -delta[axis_idx]
+        new_pos = center + delta
+
+        # Create new camera
+        cam_data = bpy.data.cameras.new(name=f'{cam.name}_mirror_{self.mirror_axis}')
+        cam_obj = bpy.data.objects.new(cam_data.name, cam_data)
+        context.collection.objects.link(cam_obj)
+
+        # Copy settings
+        cam_obj.data.type = cam.data.type
+        cam_obj.data.lens = cam.data.lens
+        cam_obj.data.sensor_width = cam.data.sensor_width
+        cam_obj.data.sensor_height = cam.data.sensor_height
+        cam_obj.data.clip_start = cam.data.clip_start
+        cam_obj.data.clip_end = cam.data.clip_end
+
+        cam_obj.location = new_pos
+        direction = center - new_pos
+        rot_quat = direction.to_track_quat('-Z', 'Y')
+        cam_obj.rotation_euler = rot_quat.to_euler()
+
+        self.report({'INFO'}, f"Mirrored camera created: {cam_obj.name}")
+        return {'FINISHED'}
+
+
+class ToggleCameraLabels(bpy.types.Operator):
+    """Toggle floating camera prompt labels in the 3D viewport.
+
+    Shows or hides the per-camera prompt text (from Collect Camera Prompts
+    or auto-generated view labels) next to each camera in the viewport."""
+    bl_idname = "object.toggle_camera_labels"
+    bl_label = "Toggle Camera Labels"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return any(o.type == 'CAMERA' for o in context.scene.objects)
+
+    def execute(self, context):
+        global _sg_label_draw_handle
+        if _sg_label_draw_handle is not None:
+            _sg_remove_label_overlay()
+            self.report({'INFO'}, "Camera labels hidden")
+        else:
+            _sg_ensure_label_overlay()
+            self.report({'INFO'}, "Camera labels visible")
+        return {'FINISHED'}
+
         
 # Define the PropertyGroup to store camera prompts
 class CameraPromptItem(bpy.types.PropertyGroup):
@@ -1455,6 +3285,8 @@ class CollectCameraPrompts(bpy.types.Operator):
             switch_viewport_to_camera(context, next_cam) # Switch viewport
             return context.window_manager.invoke_props_dialog(self, width=400) # Show next dialog
         else:
+            # Refresh the floating labels so edited prompts appear
+            _sg_ensure_label_overlay()
             self.report({'INFO'}, f"Collected prompts for {len(self._cameras)} cameras.")
             return {'FINISHED'}
     

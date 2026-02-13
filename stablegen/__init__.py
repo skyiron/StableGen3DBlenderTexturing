@@ -1,7 +1,7 @@
 """ This script registers the addon. """
 import bpy # pylint: disable=import-error
 from .stablegen import StableGenPanel, ApplyPreset, SavePreset, DeletePreset, get_preset_items, update_parameters, ResetQwenPrompt
-from .render_tools import BakeTextures, AddCameras, SwitchMaterial, ExportOrbitGIF, CollectCameraPrompts, CameraPromptItem 
+from .render_tools import BakeTextures, AddCameras, CloneCamera, MirrorCamera, ToggleCameraLabels, SwitchMaterial, ExportOrbitGIF, CollectCameraPrompts, CameraPromptItem 
 from .utils import AddHDRI, ApplyModifiers, CurvesToMesh
 from .generator import ComfyUIGenerate, Reproject, Regenerate, MirrorReproject
 import os
@@ -26,6 +26,9 @@ classes = [
     ResetQwenPrompt,
     BakeTextures,
     AddCameras,
+    CloneCamera,
+    MirrorCamera,
+    ToggleCameraLabels,
     SwitchMaterial,
     ExportOrbitGIF,
     CollectCameraPrompts,
