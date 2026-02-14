@@ -1,7 +1,8 @@
 """ This script registers the addon. """
 import bpy # pylint: disable=import-error
 from .stablegen import StableGenPanel, ApplyPreset, SavePreset, DeletePreset, get_preset_items, update_parameters, ResetQwenPrompt
-from .render_tools import BakeTextures, AddCameras, CloneCamera, MirrorCamera, ToggleCameraLabels, SwitchMaterial, ExportOrbitGIF, CollectCameraPrompts, CameraPromptItem 
+from .render_tools import BakeTextures, AddCameras, CloneCamera, MirrorCamera, ToggleCameraLabels, SwitchMaterial, ExportOrbitGIF, CollectCameraPrompts, CameraPromptItem
+from .debug_tools import debug_classes as _debug_classes
 from .utils import AddHDRI, ApplyModifiers, CurvesToMesh
 from .generator import ComfyUIGenerate, Reproject, Regenerate, MirrorReproject
 import os
@@ -201,6 +202,28 @@ class StableGenAddonPreferences(bpy.types.AddonPreferences):
         default=False
     ) # type: ignore
 
+    overlay_color: bpy.props.FloatVectorProperty(
+        name="Overlay Color",
+        description="Color used for the camera aspect-ratio crop rectangle and floating view labels in the viewport",
+        subtype='COLOR',
+        size=3,
+        min=0.0, max=1.0,
+        default=(0.3, 0.5, 1.0),
+        update=lambda self, ctx: [a.tag_redraw() for a in ctx.screen.areas if a.type == 'VIEW_3D'] if ctx.screen else None
+    ) # type: ignore
+
+    enable_debug: bpy.props.BoolProperty(
+        name="Enable Debug Settings",
+        description="Show diagnostic tools in the main panel for visualising projection weights, blending and coverage",
+        default=False
+    ) # type: ignore
+
+    show_advanced: bpy.props.BoolProperty(
+        name="Advanced Preferences",
+        description="Show advanced preferences",
+        default=False
+    ) # type: ignore
+
     def draw(self, context):
         """     
         Draws the preferences panel.         
@@ -240,6 +263,17 @@ class StableGenAddonPreferences(bpy.types.AddonPreferences):
                   "controlnet_mapping_index", # Property name for active index
                   rows=rows
              )
+
+        # --- Advanced Preferences ---
+        layout.separator()
+        adv_box = layout.box()
+        row = adv_box.row()
+        row.prop(self, "show_advanced",
+                 icon='TRIA_DOWN' if self.show_advanced else 'TRIA_RIGHT',
+                 emboss=False, text="Advanced Preferences")
+        if self.show_advanced:
+            adv_box.prop(self, "overlay_color")
+            adv_box.prop(self, "enable_debug")
 
 class CheckServerStatus(bpy.types.Operator):
     """Checks if the ComfyUI server is reachable."""
@@ -1108,6 +1142,8 @@ def load_handler(dummy):
 classes_to_append = [CheckServerStatus, RefreshCheckpointList, RefreshLoRAList, STABLEGEN_UL_ControlNetMappingList, ControlNetModelMappingItem, RefreshControlNetMappings, StableGenAddonPreferences, ControlNetUnit, LoRAUnit, AddControlNetUnit, RemoveControlNetUnit, AddLoRAUnit, RemoveLoRAUnit]
 for cls in classes_to_append:
     classes.append(cls)
+for cls in _debug_classes:
+    classes.append(cls)
 
 def register():
     """     
@@ -1446,7 +1482,7 @@ def register():
     bpy.types.Scene.denoise = bpy.props.FloatProperty(
         name="Denoise",
         description="Denoise level for refining",
-        default=1.0,
+        default=0.8,
         min=0.0,
         max=1.0,
         update=update_parameters
@@ -1677,7 +1713,7 @@ def register():
     )
     bpy.types.Scene.visibility_vignette_softness = bpy.props.FloatProperty(
         name="Vignette Softness",
-        description="Exponent shaping feather falloff (<1 = softer, >1 = sharper)",
+        description="Exponent shaping feather falloff (<1 = sharper transition, >1 = softer/wider transition)",
         default=0.5,
         min=0.1,
         max=5.0,
@@ -1727,6 +1763,38 @@ def register():
         default=0.6,
         min=0.0,
         max=1.0,
+        update=update_parameters
+    )
+
+    bpy.types.Scene.refine_edge_feather_projection = bpy.props.BoolProperty(
+        name="Edge Feather (Projection)",
+        description="Add a screen-space distance-transform ramp at the projection "
+                    "silhouette boundary as an additional multiplier on top of the "
+                    "angle×feather weight. Interior surfaces keep full strength; "
+                    "only the geometric edge is softened",
+        default=False,
+        update=update_parameters
+    )
+    bpy.types.Scene.refine_edge_feather_width = bpy.props.IntProperty(
+        name="Edge Feather Width",
+        description="Width in pixels of the transition band at projection boundaries. "
+                    "Larger values produce a wider blend zone",
+        default=30,
+        min=1,
+        max=200,
+        update=update_parameters
+    )
+    bpy.types.Scene.refine_edge_feather_softness = bpy.props.FloatProperty(
+        name="Edge Feather Softness",
+        description="Rounds off the sharp corners at both ends of the linear feather ramp "
+                    "using a Gaussian blur.  0 = raw linear ramp (hard kinks at edge and "
+                    "interior boundary).  1 = moderate smoothing.  Higher values give "
+                    "progressively gentler transitions without shifting the ramp position",
+        default=1.0,
+        min=0.0,
+        max=5.0,
+        step=10,
+        precision=2,
         update=update_parameters
     )
 
@@ -1806,6 +1874,20 @@ def register():
             ('viewport', 'Viewport Render', 'Use viewport render (OpenGL) for structural guidance')
         ],
         default='depth',
+        update=update_parameters
+    )
+
+    bpy.types.Scene.qwen_voronoi_mode = bpy.props.BoolProperty(
+        name="Voronoi Projection",
+        description=(
+            "Instead of zeroing weights of non-generated cameras, keep natural "
+            "angle-based weights and project magenta from cameras that have not "
+            "been generated yet. Use a high Weight Exponent to achieve Voronoi-"
+            "like segmentation where each surface point is dominated by its "
+            "closest camera. This eliminates the need for low discard-over-angle "
+            "thresholds"
+        ),
+        default=False,
         update=update_parameters
     )
 
@@ -2129,6 +2211,9 @@ def unregister():
     del bpy.types.Scene.visibility_vignette
     del bpy.types.Scene.visibility_vignette_width
     del bpy.types.Scene.visibility_vignette_softness
+    del bpy.types.Scene.refine_edge_feather_projection
+    del bpy.types.Scene.refine_edge_feather_width
+    del bpy.types.Scene.refine_edge_feather_softness
     del bpy.types.Scene.differential_diffusion
     del bpy.types.Scene.differential_noise
     del bpy.types.Scene.blur_mask
@@ -2162,6 +2247,7 @@ def unregister():
     del bpy.types.Scene.early_priority
     del bpy.types.Scene.texture_objects
     del bpy.types.Scene.qwen_guidance_map_type
+    del bpy.types.Scene.qwen_voronoi_mode
     del bpy.types.Scene.qwen_context_render_mode
     del bpy.types.Scene.qwen_use_external_style_image
     del bpy.types.Scene.qwen_external_style_image

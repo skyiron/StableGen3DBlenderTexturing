@@ -17,7 +17,7 @@ import colorsys
 from PIL import Image, ImageEnhance
 
 from .util.helpers import prompt_text, prompt_text_img2img, prompt_text_qwen_image_edit # pylint: disable=relative-beyond-top-level
-from .render_tools import export_emit_image, export_visibility, export_canny, bake_texture, prepare_baking, unwrap, export_render, export_viewport, _SGCameraResolution, _get_camera_resolution, _sg_restore_square_display, _sg_remove_crop_overlay, _sg_ensure_crop_overlay, _sg_hide_label_overlay, _sg_restore_label_overlay # pylint: disable=relative-beyond-top-level
+from .render_tools import export_emit_image, export_visibility, export_canny, bake_texture, prepare_baking, unwrap, export_render, export_viewport, render_edge_feather_mask, _SGCameraResolution, _get_camera_resolution, _sg_restore_square_display, _sg_remove_crop_overlay, _sg_ensure_crop_overlay, _sg_hide_label_overlay, _sg_restore_label_overlay # pylint: disable=relative-beyond-top-level
 from .utils import get_last_material_index, get_generation_dirs, get_file_path, get_dir_path, remove_empty_dirs, get_compositor_node_tree, configure_output_node_paths, get_eevee_engine_id # pylint: disable=relative-beyond-top-level
 from .project import project_image, reinstate_compare_nodes # pylint: disable=relative-beyond-top-level
 from .workflows import WorkflowManager
@@ -669,6 +669,15 @@ class ComfyUIGenerate(bpy.types.Operator):
                 bpy.context.scene.camera = camera
                 with _SGCameraResolution(context, camera):
                     export_emit_image(context, self._to_texture, camera_id=i)
+                    # Render per-camera geometry silhouette mask for edge feathering
+                    if context.scene.refine_edge_feather_projection and (
+                        context.scene.generation_method == 'local_edit'
+                        or (context.scene.model_architecture.startswith('qwen')
+                            and context.scene.qwen_generation_method == 'local_edit')):
+                        render_edge_feather_mask(
+                            context, self._to_texture, camera, i,
+                            feather_width=context.scene.refine_edge_feather_width,
+                            softness=context.scene.refine_edge_feather_softness)
 
         # UV inpainting mode preparation
         if context.scene.generation_method == 'uv_inpaint':

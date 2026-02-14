@@ -100,6 +100,244 @@ def apply_vignette_to_mask(mask_file_path, feather_width=0.15, gamma=1.0, blur=T
         f"(ksize={ksize}, fw={feather_width}, gamma={gamma}, blur={blur})"
     )
 
+
+def create_edge_feathered_mask(mask_path, feather_width=30):
+    """Create an edge-feathered version of a visibility mask for projection blending.
+
+    Uses a distance transform on the binary mask so that:
+    - Interior pixels (far from any edge) → 1.0  (full new texture)
+    - Edge pixels (near visibility boundary) → ramp 0→1 over *feather_width* px
+    - Invisible pixels                      → 0.0  (keep original texture)
+
+    The result is saved next to the original with an ``_edgefeather`` suffix.
+    Returns the output path, or *None* on failure.
+    """
+    if not isinstance(mask_path, str) or not os.path.exists(mask_path):
+        print(f"[StableGen] Edge-feather: mask not found: {mask_path}")
+        return None
+
+    mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+    if mask is None:
+        print(f"[StableGen] Edge-feather: failed to read mask: {mask_path}")
+        return None
+
+    # Threshold to hard binary (visible = white, invisible = black)
+    _, binary = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+
+    # Distance transform: each white pixel → distance to nearest black pixel
+    dist = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+
+    # Normalise into [0, 1] ramp over feather_width pixels
+    feathered = np.clip(dist / max(feather_width, 1), 0.0, 1.0)
+
+    feathered_u8 = (feathered * 255).astype(np.uint8)
+
+    output_path = mask_path.replace('.png', '_edgefeather.png')
+    cv2.imwrite(output_path, feathered_u8)
+    print(f"[StableGen] Edge-feather mask saved: {output_path} (width={feather_width}px)")
+    return output_path
+
+
+def render_edge_feather_mask(context, to_export, camera, camera_index, feather_width=30, softness=1.0):
+    """Render a geometry silhouette from *camera* and apply distance-transform
+    edge feathering.
+
+    All target objects render as white (Emission), non-target mesh objects are
+    hidden, and the world is set to black.  The resulting binary silhouette is
+    distance-transformed so that interior pixels = 1.0, boundary pixels ramp
+    0→1 over *feather_width* pixels, and background = 0.0.
+
+    The final mask is saved to ``inpaint/visibility/render{camera_index}_edgefeather.png``.
+    Returns the output path, or *None* on failure.
+    """
+    output_dir = get_dir_path(context, "inpaint")["visibility"]
+    os.makedirs(output_dir, exist_ok=True)
+    raw_file = f"render{camera_index}_geomask"
+
+    # ── Save original state ─────────────────────────────────────────────────
+    original_camera = context.scene.camera
+    original_engine = context.scene.render.engine
+    original_transparent = context.scene.render.film_transparent
+    original_samples = context.scene.cycles.samples
+    original_view_transform = bpy.context.scene.view_settings.view_transform
+
+    world = context.scene.world
+    if not world:
+        world = bpy.data.worlds.new("World")
+        context.scene.world = world
+    original_use_nodes = world.use_nodes
+    original_color = world.color.copy()
+    original_bg_node_color = None
+    original_bg_node_strength = None
+    if world.use_nodes and world.node_tree:
+        for wn in world.node_tree.nodes:
+            if wn.type == 'BACKGROUND':
+                original_bg_node_color = tuple(wn.inputs["Color"].default_value)
+                original_bg_node_strength = wn.inputs["Strength"].default_value
+                break
+
+    # ── Camera ──────────────────────────────────────────────────────────────
+    context.scene.camera = camera
+
+    # ── Replace target-object materials with white Emission ─────────────────
+    saved_materials = {}
+    saved_active_materials = {}
+    temp_materials = []
+    for obj in to_export:
+        saved_materials[obj] = list(obj.data.materials)
+        saved_active_materials[obj] = obj.active_material
+
+        mat = bpy.data.materials.new(name="_SG_EdgeFeather_Temp")
+        mat.use_nodes = True
+        mat.node_tree.nodes.clear()
+        emission = mat.node_tree.nodes.new("ShaderNodeEmission")
+        emission.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+        emission.inputs["Strength"].default_value = 1.0
+        out_node = mat.node_tree.nodes.new("ShaderNodeOutputMaterial")
+        mat.node_tree.links.new(emission.outputs[0], out_node.inputs["Surface"])
+
+        obj.data.materials.clear()
+        obj.data.materials.append(mat)
+        temp_materials.append(mat)
+
+    # ── Hide non-target mesh objects ────────────────────────────────────────
+    hidden_restore = {}
+    for obj in context.scene.objects:
+        if obj.type == 'MESH' and obj not in to_export:
+            hidden_restore[obj] = obj.hide_render
+            obj.hide_render = True
+
+    # ── World → black background ────────────────────────────────────────────
+    if bpy.app.version >= (5, 0, 0):
+        world.use_nodes = True
+        if world.node_tree:
+            for wn in world.node_tree.nodes:
+                if wn.type == 'BACKGROUND':
+                    wn.inputs["Color"].default_value = (0.0, 0.0, 0.0, 1.0)
+                    wn.inputs["Strength"].default_value = 1.0
+                    break
+    else:
+        world.color = (0, 0, 0)
+        world.use_nodes = False
+
+    # ── Render settings ─────────────────────────────────────────────────────
+    context.scene.render.engine = 'CYCLES'
+    context.scene.render.film_transparent = False
+    context.scene.cycles.samples = 1
+    bpy.context.scene.display_settings.display_device = 'sRGB'
+    bpy.context.scene.view_settings.view_transform = 'Raw'
+
+    view_layer = context.view_layer
+    view_layer.use_pass_emit = True
+    view_layer.use_pass_environment = True
+
+    # ── Compositor ──────────────────────────────────────────────────────────
+    context.scene.use_nodes = True
+    node_tree = get_compositor_node_tree(context.scene)
+    comp_nodes = node_tree.nodes
+    comp_links = node_tree.links
+    comp_nodes.clear()
+
+    render_layers = comp_nodes.new('CompositorNodeRLayers')
+    try:
+        mix_node = comp_nodes.new('CompositorNodeMixRGB')
+    except Exception:
+        mix_node = comp_nodes.new('ShaderNodeMixRGB')
+    mix_node.blend_type = 'ADD'
+    mix_node.inputs[0].default_value = 1
+    output_node = comp_nodes.new('CompositorNodeOutputFile')
+    configure_output_node_paths(output_node, output_dir, raw_file)
+
+    if bpy.app.version < (5, 0, 0):
+        comp_links.new(render_layers.outputs['Emit'], mix_node.inputs[1])
+        comp_links.new(render_layers.outputs['Env'], mix_node.inputs[2])
+    else:
+        comp_links.new(render_layers.outputs['Emission'], mix_node.inputs[1])
+        comp_links.new(render_layers.outputs['Environment'], mix_node.inputs[2])
+    comp_links.new(mix_node.outputs[0], output_node.inputs[0])
+
+    # ── Render ──────────────────────────────────────────────────────────────
+    bpy.ops.render.render(write_still=True)
+
+    # ── Determine actual output path ────────────────────────────────────────
+    frame_suffix = "0001" if bpy.app.version < (5, 0, 0) else ""
+    raw_path = os.path.join(output_dir, f"{raw_file}{frame_suffix}.png")
+
+    # ── Restore materials ───────────────────────────────────────────────────
+    for obj, mats in saved_materials.items():
+        obj.data.materials.clear()
+        if saved_active_materials[obj]:
+            obj.data.materials.append(saved_active_materials[obj])
+        for m in mats:
+            if m != saved_active_materials[obj]:
+                obj.data.materials.append(m)
+    for mat in temp_materials:
+        if mat and mat.name in bpy.data.materials:
+            bpy.data.materials.remove(mat)
+
+    # ── Restore non-target visibility ───────────────────────────────────────
+    for obj, was_hidden in hidden_restore.items():
+        obj.hide_render = was_hidden
+
+    # ── Restore render / world settings ─────────────────────────────────────
+    context.scene.camera = original_camera
+    context.scene.render.engine = original_engine
+    context.scene.render.film_transparent = original_transparent
+    context.scene.cycles.samples = original_samples
+    bpy.context.scene.view_settings.view_transform = original_view_transform
+    world.use_nodes = original_use_nodes
+    world.color = original_color
+    if original_bg_node_color is not None and world.node_tree:
+        for wn in world.node_tree.nodes:
+            if wn.type == 'BACKGROUND':
+                wn.inputs["Color"].default_value = original_bg_node_color
+                wn.inputs["Strength"].default_value = original_bg_node_strength
+                break
+
+    # ── Distance-transform edge feathering ──────────────────────────────────
+    if not os.path.exists(raw_path):
+        print(f"[StableGen] Edge-feather: raw mask not found after render: {raw_path}")
+        return None
+
+    mask_img = cv2.imread(raw_path, cv2.IMREAD_GRAYSCALE)
+    if mask_img is None:
+        print(f"[StableGen] Edge-feather: failed to read raw mask: {raw_path}")
+        return None
+
+    _, binary = cv2.threshold(mask_img, 127, 255, cv2.THRESH_BINARY)
+    dist = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+    linear = np.clip(dist / max(feather_width, 1), 0.0, 1.0).astype(np.float32)
+
+    # Gaussian-blur the linear ramp to round off the kinks at both ends.
+    # The linear ramp has sharp slope discontinuities at dist=0 (edge) and
+    # dist=feather_width (interior plateau).  A small Gaussian blur smooths
+    # these transitions without shifting the ramp position or compressing the
+    # transition zone the way smoothstep does.
+    #   softness == 0   → raw linear ramp (kinks preserved)
+    #   softness == 1   → moderate rounding (sigma ≈ 25% of feather width)
+    #   softness  > 1   → stronger rounding / wider smooth zone
+    if softness > 0.01:
+        blur_sigma = softness * feather_width * 0.25
+        feathered = cv2.GaussianBlur(linear, (0, 0), sigmaX=blur_sigma)
+        feathered = np.clip(feathered, 0.0, 1.0)
+    else:
+        feathered = linear
+
+    feathered_u8 = (np.clip(feathered, 0.0, 1.0) * 255).astype(np.uint8)
+
+    ef_path = os.path.join(output_dir, f"render{camera_index}_edgefeather.png")
+    cv2.imwrite(ef_path, feathered_u8)
+
+    # Clean up raw mask
+    try:
+        os.remove(raw_path)
+    except OSError:
+        pass
+
+    print(f"[StableGen] Edge-feather mask saved: {ef_path} (width={feather_width}px, softness={softness:.2f})")
+    return ef_path
+
+
 def apply_uv_inpaint_texture(context, obj, baked_image_path):
     """
     Apply a UV inpainted/baked texture to the active material.
@@ -927,13 +1165,16 @@ def expand_mask_to_blocks(mask_file_path, block_size=8):
         return None
 
 
-def export_visibility(context, to_export, obj=None, camera_visibility=None):
+def export_visibility(context, to_export, obj=None, camera_visibility=None, prepare_only=False):
     """     
     Exports the visibility of the mesh by temporarily altering the shading nodes.
     :param context: Blender context.
     :param filepath: Path to the output file.
     :param obj: Blender object.
     :param camera_visibility: Camera object for visibility calculation.
+    :param prepare_only: If True, only prepare the visibility material without
+                         baking/rendering and without restoring the original materials.
+                         Used by debug tools to inspect the material in the viewport.
     :return: None
     """
     # Store original materials and create temporary ones
@@ -985,8 +1226,13 @@ def export_visibility(context, to_export, obj=None, camera_visibility=None):
         
         # Determine which input to used based on existence of BSDF node before the output
         if output.inputs[0].links and output.inputs[0].links[0].from_node.type == 'BSDF_PRINCIPLED':
-            color_mix = output.inputs[0].links[0].from_node.inputs[0].links[0].from_node
-            input = output.inputs[0].links[0].from_node.inputs[0]
+            principled = output.inputs[0].links[0].from_node
+            if not principled.inputs[0].links:
+                # Principled BSDF exists but nothing is connected to its
+                # Base Color – this is not a projection material.
+                return False
+            color_mix = principled.inputs[0].links[0].from_node
+            input = principled.inputs[0]
         else:
             color_mix = output.inputs[0].links[0].from_node
             input = output.inputs[0]
@@ -1052,6 +1298,83 @@ def export_visibility(context, to_export, obj=None, camera_visibility=None):
                     node.inputs[1].default_value = context.scene.weight_exponent if context.scene.weight_exponent_mask else 1.0
                 except Exception as e:
                     print(f"  - Warning: Failed to set Power for native node '{node.name}'. Error: {e}")
+
+        # When the normalization chain exists (multi-camera), the node
+        # chain is:  power_weight(exp=1) → base_weight → NormW(÷max) →
+        #            SharpW(pow exp) → mix tree.
+        # For the visibility map we need the *original* un-normalized
+        # weight: pow(cos(θ), target_exp) × binary_gates.
+        # We achieve this by:
+        #   1. Setting power_weight to target_exp (restores original weight)
+        #   2. Making SharpW a passthrough (exp=1) and rerouting its input
+        #      from NormW's source (the base weight) so the DIVIDE-by-max
+        #      is bypassed entirely.
+        has_norm_nodes = any(
+            n.type == 'MATH' and n.operation == 'DIVIDE'
+            and n.label.startswith('NormW-')
+            for n in nodes
+        )
+        if has_norm_nodes:
+            target_exp = context.scene.weight_exponent if context.scene.weight_exponent_mask else 1.0
+            for node in nodes:
+                # Restore per-camera power to the desired exponent
+                if (node.type == 'MATH' and node.operation == 'POWER'
+                        and node.label == 'power_weight'):
+                    try:
+                        node.inputs[1].default_value = target_exp
+                    except Exception as e:
+                        print(f"  - Warning: Failed to set power_weight '{node.name}'. Error: {e}")
+                elif node.type == 'SCRIPT' and "Power" in node.inputs:
+                    try:
+                        node.inputs["Power"].default_value = target_exp
+                    except Exception as e:
+                        print(f"  - Warning: Failed to set OSL Power '{node.name}'. Error: {e}")
+
+                # Bypass NormW+SharpW: reroute SharpW to read from
+                # NormW's source (the base weight), set exponent to 1.0
+                elif (node.type == 'MATH' and node.operation == 'POWER'
+                        and node.label.startswith('SharpW-')):
+                    try:
+                        # SharpW.inputs[0] ← NormW.outputs[0]
+                        # NormW.inputs[0]  ← base_weight_output
+                        # Reroute: SharpW.inputs[0] ← base_weight_output
+                        if node.inputs[0].links:
+                            norm_node = node.inputs[0].links[0].from_node
+                            if (norm_node.label.startswith('NormW-')
+                                    and norm_node.inputs[0].links):
+                                base_out = norm_node.inputs[0].links[0].from_socket
+                                links.remove(node.inputs[0].links[0])
+                                links.new(base_out, node.inputs[0])
+                        node.inputs[1].default_value = 1.0
+                    except Exception as e:
+                        print(f"  - Warning: Failed to bypass SharpW '{node.name}'. Error: {e}")
+
+                # Also bypass standalone NormW nodes (when user_exponent
+                # was 1.0 at build time, there's no SharpW — the NormW
+                # DIVIDE node is used directly in the mix tree).
+                elif (node.type == 'MATH' and node.operation == 'DIVIDE'
+                        and node.label.startswith('NormW-')):
+                    try:
+                        # Check if this NormW feeds directly into the
+                        # mix tree (no SharpW after it).
+                        feeds_sharp = False
+                        for link in node.outputs[0].links:
+                            if (link.to_node.type == 'MATH'
+                                    and link.to_node.operation == 'POWER'
+                                    and link.to_node.label.startswith('SharpW-')):
+                                feeds_sharp = True
+                                break
+                        if not feeds_sharp:
+                            # This NormW feeds the mix tree directly.
+                            # Reroute its downstream links to its source.
+                            if node.inputs[0].links:
+                                base_out = node.inputs[0].links[0].from_socket
+                                for link in list(node.outputs[0].links):
+                                    to_socket = link.to_socket
+                                    links.remove(link)
+                                    links.new(base_out, to_socket)
+                    except Exception as e:
+                        print(f"  - Warning: Failed to bypass NormW '{node.name}'. Error: {e}")
                
         return True
     
@@ -1066,6 +1389,13 @@ def export_visibility(context, to_export, obj=None, camera_visibility=None):
         if not prepare_material(obj):
             return False
         
+    if prepare_only:
+        # Debug mode: leave the visibility material applied for viewport inspection
+        # Rename the temp materials so they are identifiable as debug materials
+        for obj_key, temp_mat in temporary_materials.items():
+            temp_mat.name = f"SG_Debug_Visibility_{obj_key.name}"
+        return True
+
     # Bake or render the texture
     if not camera_visibility:
         output_dir = get_dir_path(context, "uv_inpaint")["visibility"]
@@ -1118,6 +1448,43 @@ def export_visibility(context, to_export, obj=None, camera_visibility=None):
 # =========================================================
 # Camera Placement Helper Functions
 # =========================================================
+
+
+def _existing_camera_directions(mesh_center):
+    """Return unit-direction vectors from *mesh_center* toward each existing
+    camera in the scene.  Used by 'Consider existing cameras' to treat
+    pre-existing cameras as already-placed directions."""
+    dirs = []
+    center = np.array(mesh_center, dtype=float)
+    for obj in bpy.data.objects:
+        if obj.type == 'CAMERA':
+            pos = np.array(obj.location, dtype=float)
+            d = pos - center
+            norm = np.linalg.norm(d)
+            if norm > 1e-6:
+                dirs.append(d / norm)
+    return dirs
+
+
+def _filter_near_existing(directions, existing_dirs, min_angle_deg=30.0):
+    """Remove directions that are within *min_angle_deg* of any existing
+    camera direction.  Both *directions* and *existing_dirs* should be
+    lists of unit-length numpy arrays."""
+    if not existing_dirs or not directions:
+        return directions
+    cos_thresh = math.cos(math.radians(min_angle_deg))
+    existing_np = np.array(existing_dirs)          # (M, 3)
+    filtered = []
+    for d in directions:
+        d_np = np.asarray(d, dtype=float)
+        n = np.linalg.norm(d_np)
+        if n < 1e-12:
+            continue
+        d_unit = d_np / n
+        dots = existing_np @ d_unit                # (M,)
+        if dots.max() < cos_thresh:
+            filtered.append(d)
+    return filtered
 
 def _fibonacci_sphere_points(n):
     """Generate *n* approximately evenly-spaced unit vectors on a sphere
@@ -1363,7 +1730,8 @@ def _compute_pca_axes(verts):
 
 
 def _greedy_coverage_directions(normals, areas, max_cameras=12,
-                                coverage_target=0.95, n_candidates=200):
+                                coverage_target=0.95, n_candidates=200,
+                                existing_dirs=None):
     """Greedy set-cover: iteratively pick the camera direction that adds the
     most newly-visible surface area (back-face culling only, no occlusion,
     for speed).  Returns (selected_directions, final_coverage_fraction)."""
@@ -1378,6 +1746,10 @@ def _greedy_coverage_directions(normals, areas, max_cameras=12,
     visibility = normals @ candidates.T > 0.26  # (n_faces, n_candidates)
 
     covered = np.zeros(len(areas), dtype=bool)
+    # Pre-seed coverage from existing cameras
+    if existing_dirs:
+        for edir in existing_dirs:
+            covered |= normals @ np.asarray(edir, dtype=float) > 0.26
     selected = []
 
     for _ in range(max_cameras):
@@ -1442,7 +1814,8 @@ def _ray_occluded(bvh_trees, origin, direction, max_dist):
 
 
 def _greedy_select_from_visibility(vis, areas, max_cameras, coverage_target,
-                                   candidates):
+                                   candidates, existing_dirs=None,
+                                   normals=None):
     """Run greedy set-cover on a pre-computed visibility matrix.
 
     Parameters
@@ -1452,6 +1825,10 @@ def _greedy_select_from_visibility(vis, areas, max_cameras, coverage_target,
     max_cameras : int
     coverage_target : float
     candidates : ndarray (n_candidates, 3)
+    existing_dirs : list[ndarray] or None
+        Directions of existing cameras to pre-seed coverage.
+    normals : ndarray (n_faces, 3) or None
+        Face normals, required when *existing_dirs* is given.
 
     Returns
     -------
@@ -1462,6 +1839,10 @@ def _greedy_select_from_visibility(vis, areas, max_cameras, coverage_target,
         return [], 0.0
 
     covered = np.zeros(len(areas), dtype=bool)
+    # Pre-seed coverage from existing cameras
+    if existing_dirs and normals is not None:
+        for edir in existing_dirs:
+            covered |= normals @ np.asarray(edir, dtype=float) > 0.26
     selected = []
 
     for _ in range(max_cameras):
@@ -1526,8 +1907,42 @@ def _occ_filter_faces_generator(normals, areas, centers, bvh_trees,
     return exterior
 
 
+def _occ_vis_count_generator(normals, areas, centers, bvh_trees,
+                              n_candidates=200):
+    """Generator: count how many candidate directions can see each face.
+
+    Like ``_occ_filter_faces_generator`` but returns per-face visibility
+    *counts* instead of a boolean mask.  This enables continuous weighting
+    rather than binary keep/remove filtering.
+
+    Yields progress floats in [0, 1].  Final result (via
+    ``StopIteration.value``) is an int array ``(n_faces,)`` with the number
+    of unoccluded candidate directions per face.
+    """
+    n_faces = len(normals)
+    candidates = np.array(_fibonacci_sphere_points(n_candidates))
+    backface_vis = normals @ candidates.T > 0.26  # (F, C)
+    vis_count = np.zeros(n_faces, dtype=int)
+    epsilon = 0.001
+    BATCH = 5
+
+    for j in range(n_candidates):
+        cam_dir = candidates[j]
+        for i in range(n_faces):
+            if not backface_vis[i, j]:
+                continue
+            origin = centers[i] + normals[i] * epsilon
+            if not _ray_occluded(bvh_trees, origin, cam_dir, 1e6):
+                vis_count[i] += 1
+        if (j + 1) % BATCH == 0 or j == n_candidates - 1:
+            yield (j + 1) / n_candidates
+
+    return vis_count
+
+
 def _occ_fom_generator(normals, areas, centers, bvh_trees,
-                       max_cameras, coverage_target, n_candidates=200):
+                       max_cameras, coverage_target, n_candidates=200,
+                       existing_dirs=None):
     """Generator: Full Occlusion Matrix approach.
 
     Yields progress floats in [0, 1].  Final result is available via
@@ -1557,11 +1972,13 @@ def _occ_fom_generator(normals, areas, centers, bvh_trees,
             yield (j + 1) / n_candidates
 
     return _greedy_select_from_visibility(
-        vis, areas, max_cameras, coverage_target, candidates)
+        vis, areas, max_cameras, coverage_target, candidates,
+        existing_dirs=existing_dirs, normals=normals)
 
 
 def _occ_tpr_generator(normals, areas, centers, bvh_trees,
-                       max_cameras, coverage_target, n_candidates=200):
+                       max_cameras, coverage_target, n_candidates=200,
+                       existing_dirs=None):
     """Generator: Two-Pass Refinement approach.
 
     Yields progress floats in [0, 1].  Final result is available via
@@ -1577,6 +1994,10 @@ def _occ_tpr_generator(normals, areas, centers, bvh_trees,
 
     # ── Pass 1: fast greedy (back-face only, instant) ─────────────────
     covered_bf = np.zeros(len(areas), dtype=bool)
+    # Pre-seed coverage from existing cameras
+    if existing_dirs:
+        for edir in existing_dirs:
+            covered_bf |= normals @ np.asarray(edir, dtype=float) > 0.26
     selected_indices = []
 
     for _ in range(max_cameras):
@@ -1929,7 +2350,9 @@ def _sg_draw_crop_overlays():
         indices = [(0, 1), (1, 2), (2, 3), (3, 0)]
         batch = batch_for_shader(shader, 'LINES', {"pos": coords}, indices=indices)
         shader.bind()
-        shader.uniform_float("color", (1.0, 0.55, 0.0, 0.9))
+        _prefs = bpy.context.preferences.addons.get(__package__)
+        _oc = _prefs.preferences.overlay_color if _prefs else (0.3, 0.5, 1.0)
+        shader.uniform_float("color", (_oc[0], _oc[1], _oc[2], 0.9))
         gpu.state.line_width_set(2.0)
         gpu.state.blend_set('ALPHA')
         batch.draw(shader)
@@ -1958,7 +2381,9 @@ def _sg_draw_view_labels():
 
     font_id = 0
     blf.size(font_id, 13)
-    blf.color(font_id, 1.0, 0.85, 0.35, 0.95)
+    _prefs = bpy.context.preferences.addons.get(__package__)
+    _oc = _prefs.preferences.overlay_color if _prefs else (0.3, 0.5, 1.0)
+    blf.color(font_id, _oc[0], _oc[1], _oc[2], 0.95)
 
     # Build a lookup of camera name -> prompt text
     prompt_lookup = {item.name: item.prompt for item in scene.camera_prompts
@@ -2123,7 +2548,7 @@ class AddCameras(bpy.types.Operator):
             ('greedy_coverage', "Auto (Greedy Coverage)", "Iteratively add cameras that maximise new visible surface. Automatically determines the number of cameras needed"),
             ('fan_from_camera', "Fan from Camera", "Spread cameras in an arc around the active camera's orbit position"),
         ],
-        default='orbit_ring'
+        default='normal_weighted'
     ) # type: ignore
 
     num_cameras: bpy.props.IntProperty(
@@ -2145,8 +2570,14 @@ class AddCameras(bpy.types.Operator):
     ) # type: ignore
 
     purge_others: bpy.props.BoolProperty(
-        name="Remove Other Cameras",
-        description="Delete all existing cameras except the active/reference camera before adding new ones",
+        name="Remove Existing Cameras",
+        description="Delete ALL existing cameras (including active) before adding new ones",
+        default=True
+    ) # type: ignore
+
+    consider_existing: bpy.props.BoolProperty(
+        name="Consider Existing Cameras",
+        description="Treat existing cameras as already-placed directions so auto modes avoid duplicating their coverage",
         default=True
     ) # type: ignore
 
@@ -2208,6 +2639,13 @@ class AddCameras(bpy.types.Operator):
         default=False
     ) # type: ignore
 
+    review_placement: bpy.props.BoolProperty(
+        name="Review Camera Placement",
+        description="After placing cameras, fly through each one for review. "
+                    "When disabled the cameras are created immediately without the interactive fly-through",
+        default=True
+    ) # type: ignore
+
     occlusion_mode: bpy.props.EnumProperty(
         name="Occlusion Handling",
         description="How to account for self-occlusion when choosing camera directions",
@@ -2218,6 +2656,14 @@ class AddCameras(bpy.types.Operator):
              "Build a complete BVH-validated visibility matrix before greedy selection. Most accurate but slower"),
             ('two_pass', "Two-Pass Refinement",
              "Fast back-face pass, then targeted BVH refinement only for faces with zero true coverage"),
+            ('vis_weighted', "Visibility-Weighted",
+             "Weight faces by their visibility fraction from 200 directions. "
+             "Mostly-occluded faces have reduced influence on camera placement (linear). "
+             "Only affects Normal-Weighted mode; other modes fall back to Full Occlusion Matrix"),
+            ('vis_interactive', "Interactive Visibility",
+             "Like Visibility-Weighted but with a real-time preview: scroll to adjust "
+             "the occlusion balance and see cameras reposition instantly. "
+             "Only affects Normal-Weighted mode; other modes fall back to Full Occlusion Matrix"),
         ],
         default='none'
     ) # type: ignore
@@ -2232,6 +2678,13 @@ class AddCameras(bpy.types.Operator):
     _occ_gen = None
     _occ_progress = 0.0
     _occ_state = None
+    # Interactive visibility preview state
+    _vis_preview_phase = False
+    _vis_count = None
+    _vis_n_candidates = 200
+    _vis_balance = 0.2
+    _vis_state = None
+    _vis_directions = None
 
     def draw(self, context):
         """Custom dialog layout for the placement mode selector."""
@@ -2256,7 +2709,10 @@ class AddCameras(bpy.types.Operator):
             if self.exclude_bottom:
                 layout.prop(self, "exclude_bottom_angle")
             layout.prop(self, "auto_prompts")
+        layout.prop(self, "review_placement")
         layout.prop(self, "purge_others")
+        if not self.purge_others and is_auto:
+            layout.prop(self, "consider_existing")
 
     def draw_callback(self, context):
         # ── Occlusion progress display ───────────────────────────────────
@@ -2283,6 +2739,37 @@ class AddCameras(bpy.types.Operator):
             blf.size(font_id, 13)
             hw, _hh = blf.dimensions(font_id, hint)
             blf.position(font_id, (rw - hw) / 2, bar_y - 18, 0)
+            blf.color(font_id, 0.7, 0.7, 0.7, 0.8)
+            blf.draw(font_id, hint)
+            blf.color(font_id, 1.0, 1.0, 1.0, 1.0)
+            return
+
+        # ── Interactive visibility preview HUD ───────────────────────────
+        if self._vis_preview_phase:
+            font_id = 0
+            region = context.region
+            rw, rh = region.width, region.height
+            balance = self._vis_balance
+
+            msg = f"Occlusion Balance: {balance:.0%}"
+            blf.size(font_id, 22)
+            tw, _th = blf.dimensions(font_id, msg)
+            blf.position(font_id, (rw - tw) / 2, rh * 0.13, 0)
+            blf.color(font_id, 1.0, 0.85, 0.35, 0.95)
+            blf.draw(font_id, msg)
+
+            n_cams = len(self._cameras) if self._cameras else 0
+            info = f"{n_cams} cameras"
+            blf.size(font_id, 16)
+            iw, _ih = blf.dimensions(font_id, info)
+            blf.position(font_id, (rw - iw) / 2, rh * 0.13 - 26, 0)
+            blf.color(font_id, 0.9, 0.9, 0.9, 0.9)
+            blf.draw(font_id, info)
+
+            hint = "Scroll \u2191\u2193 to adjust  |  ENTER to confirm  |  ESC to cancel"
+            blf.size(font_id, 13)
+            hw, _hh = blf.dimensions(font_id, hint)
+            blf.position(font_id, (rw - hw) / 2, rh * 0.13 - 48, 0)
             blf.color(font_id, 0.7, 0.7, 0.7, 0.8)
             blf.draw(font_id, hint)
             blf.color(font_id, 1.0, 1.0, 1.0, 1.0)
@@ -2321,10 +2808,10 @@ class AddCameras(bpy.types.Operator):
                 blf.color(font_id, 1.0, 1.0, 1.0, 1.0)
 
     def execute(self, context):
-        # --- Delete other cameras if requested ---
+        # --- Delete existing cameras if requested ---
         if self.purge_others:
             scene = context.scene
-            to_remove = [obj for obj in bpy.data.objects if obj.type == 'CAMERA' and obj != scene.camera]
+            to_remove = [obj for obj in bpy.data.objects if obj.type == 'CAMERA']
             for cam in to_remove:
                 for col in list(cam.users_collection):
                     col.objects.unlink(cam)
@@ -2332,6 +2819,7 @@ class AddCameras(bpy.types.Operator):
             for cam_data in list(bpy.data.cameras):
                 if not cam_data.users:
                     bpy.data.cameras.remove(cam_data)
+            scene.camera = None
 
         # --- Validate mesh requirement for mesh-based modes ---
         if self.placement_mode in ('hemisphere', 'normal_weighted', 'pca_axes', 'greedy_coverage'):
@@ -2434,6 +2922,14 @@ class AddCameras(bpy.types.Operator):
             mesh_names = ', '.join(o.name for o in target_meshes)
             self.report({'INFO'}, f"Target meshes ({len(target_meshes)}): {mesh_names}")
 
+            # --- Collect existing camera directions (for "consider existing") ---
+            existing_dirs = None
+            if not self.purge_others and self.consider_existing:
+                existing_dirs = _existing_camera_directions(mesh_center)
+                if existing_dirs:
+                    self.report({'INFO'},
+                        f"Considering {len(existing_dirs)} existing camera(s)")
+
             # --- Determine directions ---
             if self.placement_mode == 'greedy_coverage':
                 normals, areas, centers = _get_mesh_face_data(target_meshes)
@@ -2446,21 +2942,25 @@ class AddCameras(bpy.types.Operator):
                     directions, coverage = _greedy_coverage_directions(
                         normals, areas,
                         max_cameras=self.max_auto_cameras,
-                        coverage_target=self.coverage_target)
+                        coverage_target=self.coverage_target,
+                        existing_dirs=existing_dirs)
                     directions = [np.array(d) for d in directions]
                     self.report({'INFO'},
                         f"Greedy coverage (no occlusion): "
                         f"{len(directions)} cameras, {coverage*100:.1f}% coverage")
                 else:
+                    # Greedy doesn't use K-means; vis modes fall back to FOM
+                    eff_occ = occ if occ in ('full_matrix', 'two_pass') else 'full_matrix'
                     # ── Async occlusion via modal ────────────────────────
                     depsgraph = context.evaluated_depsgraph_get()
                     bvh_trees = _build_bvh_trees(target_meshes, depsgraph)
-                    gen_func = (_occ_fom_generator if occ == 'full_matrix'
+                    gen_func = (_occ_fom_generator if eff_occ == 'full_matrix'
                                 else _occ_tpr_generator)
                     self._occ_gen = gen_func(
                         normals, areas, centers, bvh_trees,
                         max_cameras=self.max_auto_cameras,
-                        coverage_target=self.coverage_target)
+                        coverage_target=self.coverage_target,
+                        existing_dirs=existing_dirs)
                     self._occ_phase = True
                     self._occ_progress = 0.0
                     self._occ_state = {
@@ -2483,6 +2983,8 @@ class AddCameras(bpy.types.Operator):
                     # Remove directions that point more than the threshold below the horizon
                     threshold_z = -math.cos(self.exclude_bottom_angle)
                     directions = [d for d in directions if d[2] >= threshold_z]
+                if existing_dirs:
+                    directions = _filter_near_existing(directions, existing_dirs)
             elif self.placement_mode == 'normal_weighted':
                 normals, areas, centers = _get_mesh_face_data(target_meshes)
                 if self.exclude_bottom:
@@ -2490,7 +2992,32 @@ class AddCameras(bpy.types.Operator):
                         normals, areas, centers, self.exclude_bottom_angle)
 
                 occ = self.occlusion_mode
-                if occ != 'none':
+                if occ in ('vis_weighted', 'vis_interactive'):
+                    # Visibility-count generator (shared by both modes)
+                    depsgraph = context.evaluated_depsgraph_get()
+                    bvh_trees = _build_bvh_trees(target_meshes, depsgraph)
+                    self._occ_gen = _occ_vis_count_generator(
+                        normals, areas, centers, bvh_trees)
+                    self._occ_phase = True
+                    self._occ_progress = 0.0
+                    rt = 'vis_kmeans' if occ == 'vis_weighted' else 'vis_interactive'
+                    self._occ_state = {
+                        'result_type': rt,
+                        'normals': normals,
+                        'areas': areas,
+                        'centers': centers,
+                        'num_cameras': self.num_cameras,
+                        'verts_world': verts_world,
+                        'mesh_center': mesh_center,
+                        'cam_settings': cam_settings,
+                        'temp_cam_data': temp_cam_data,
+                        'existing_dirs': existing_dirs,
+                    }
+                    context.window_manager.modal_handler_add(self)
+                    self._timer = context.window_manager.event_timer_add(
+                        0.01, window=context.window)
+                    return {'RUNNING_MODAL'}
+                elif occ != 'none':
                     depsgraph = context.evaluated_depsgraph_get()
                     bvh_trees = _build_bvh_trees(target_meshes, depsgraph)
                     self._occ_gen = _occ_filter_faces_generator(
@@ -2507,6 +3034,7 @@ class AddCameras(bpy.types.Operator):
                         'mesh_center': mesh_center,
                         'cam_settings': cam_settings,
                         'temp_cam_data': temp_cam_data,
+                        'existing_dirs': existing_dirs,
                     }
                     context.window_manager.modal_handler_add(self)
                     self._timer = context.window_manager.event_timer_add(
@@ -2516,6 +3044,8 @@ class AddCameras(bpy.types.Operator):
                     k = min(self.num_cameras, len(normals))
                     cluster_dirs = _kmeans_on_sphere(normals, areas, k)
                     directions = [cluster_dirs[i] for i in range(len(cluster_dirs))]
+                    if existing_dirs:
+                        directions = _filter_near_existing(directions, existing_dirs)
             elif self.placement_mode == 'pca_axes':
                 normals, areas, centers = _get_mesh_face_data(target_meshes)
                 if self.exclude_bottom:
@@ -2523,7 +3053,8 @@ class AddCameras(bpy.types.Operator):
                         normals, areas, centers, self.exclude_bottom_angle)
 
                 occ = self.occlusion_mode
-                if occ != 'none':
+                # PCA doesn't use K-means; vis modes fall back to filter
+                if occ not in ('none',):
                     depsgraph = context.evaluated_depsgraph_get()
                     bvh_trees = _build_bvh_trees(target_meshes, depsgraph)
                     self._occ_gen = _occ_filter_faces_generator(
@@ -2542,6 +3073,7 @@ class AddCameras(bpy.types.Operator):
                         'mesh_center': mesh_center,
                         'cam_settings': cam_settings,
                         'temp_cam_data': temp_cam_data,
+                        'existing_dirs': existing_dirs,
                     }
                     context.window_manager.modal_handler_add(self)
                     self._timer = context.window_manager.event_timer_add(
@@ -2557,6 +3089,8 @@ class AddCameras(bpy.types.Operator):
                         threshold_z = -math.cos(self.exclude_bottom_angle)
                         directions = [d for d in directions if d[2] >= threshold_z]
                     directions = directions[:min(self.num_cameras, len(directions))]
+                    if existing_dirs:
+                        directions = _filter_near_existing(directions, existing_dirs)
 
             # Finalize: sort, aspect ratio, camera creation, auto prompts
             self._finalize_auto_cameras(
@@ -2564,9 +3098,14 @@ class AddCameras(bpy.types.Operator):
                 cam_settings, temp_cam_data)
 
         # --- Start fly-through review ---
-        if not self._start_fly_review(context):
-            return {'CANCELLED'}
-        return {'RUNNING_MODAL'}
+        if self.review_placement:
+            if not self._start_fly_review(context):
+                return {'CANCELLED'}
+            return {'RUNNING_MODAL'}
+        else:
+            # Skip review — just finish immediately
+            self._finish_without_review(context)
+            return {'FINISHED'}
 
     # -------------------------------------------------------
     # Auto-mode finalization helpers
@@ -2630,6 +3169,98 @@ class AddCameras(bpy.types.Operator):
             self.report({'INFO'},
                         f"Auto-prompts: assigned view labels to "
                         f"{len(self._cameras)} cameras")
+        elif not self.auto_prompts:
+            # Clear any pre-existing auto-prompts so stale labels don't persist
+            context.scene.camera_prompts.clear()
+            context.scene.use_camera_prompts = False
+            for cam_obj in self._cameras:
+                if 'sg_view_label' in cam_obj:
+                    del cam_obj['sg_view_label']
+            _sg_remove_label_overlay()
+
+    def _update_vis_cameras(self, context):
+        """Regenerate cameras based on current visibility balance setting."""
+        # Remove existing preview cameras
+        for cam in list(self._cameras):
+            cam_data = cam.data
+            bpy.data.objects.remove(cam, do_unlink=True)
+            if cam_data and not cam_data.users:
+                bpy.data.cameras.remove(cam_data)
+        self._cameras.clear()
+
+        state = self._vis_state
+        vis_count = self._vis_count
+        n_cand = self._vis_n_candidates
+        vis_fraction = vis_count.astype(float) / n_cand
+        balance = self._vis_balance
+
+        exterior = vis_count > 0
+        normals = state['normals'][exterior]
+        areas_base = state['areas'][exterior]
+        vf = vis_fraction[exterior]
+        # weight = area × (vis_fraction + balance × (1 - vis_fraction))
+        # balance=0: weight = area × vis_fraction (full vis-weighting)
+        # balance=1: weight = area (no vis-weighting, all exterior equal)
+        weighted_areas = areas_base * (vf + balance * (1.0 - vf))
+
+        existing_dirs = state.get('existing_dirs')
+        k = min(state['num_cameras'], len(normals))
+        if k > 0 and len(normals) > 0:
+            cluster_dirs = _kmeans_on_sphere(normals, weighted_areas, k)
+            directions = [cluster_dirs[i] for i in range(len(cluster_dirs))]
+            if existing_dirs:
+                directions = _filter_near_existing(directions, existing_dirs)
+        else:
+            directions = []
+
+        # Sort directions
+        ref_dir = None
+        rv3d = context.region_data
+        if rv3d:
+            view_dir = rv3d.view_rotation @ mathutils.Vector((0, 0, -1))
+            ref_dir = np.array([-view_dir.x, -view_dir.y, -view_dir.z])
+        directions = _sort_directions_spatially(directions, ref_dir)
+        self._vis_directions = directions
+
+        # Quick camera creation (without full finalize overhead)
+        if directions:
+            cam_settings = state['cam_settings']
+            fov_x, fov_y = _get_fov(cam_settings, context)
+            self._create_cameras_from_directions(
+                context, directions, state['mesh_center'],
+                state['verts_world'], cam_settings, fov_x, fov_y)
+            if self._cameras:
+                context.scene.camera = self._cameras[0]
+
+        n_ext = int(exterior.sum())
+        context.area.header_text_set(
+            f"Occlusion Balance: {balance:.0%}  |  "
+            f"{len(directions)} cameras, {n_ext} visible faces  |  "
+            f"Scroll to adjust  |  ENTER to confirm  |  ESC to cancel")
+
+    def _cleanup_vis_preview(self, context):
+        """Clean up interactive visibility preview state."""
+        # Delete preview cameras
+        for cam in list(self._cameras):
+            cam_data = cam.data
+            bpy.data.objects.remove(cam, do_unlink=True)
+            if cam_data and not cam_data.users:
+                bpy.data.cameras.remove(cam_data)
+        self._cameras.clear()
+
+        # Clean up temp camera data
+        state = self._vis_state
+        if state and state.get('temp_cam_data'):
+            bpy.data.cameras.remove(state['temp_cam_data'])
+
+        self._vis_preview_phase = False
+        self._vis_state = None
+        self._vis_count = None
+        context.area.header_text_set(None)
+        if AddCameras._draw_handle:
+            bpy.types.SpaceView3D.draw_handler_remove(
+                AddCameras._draw_handle, 'WINDOW')
+            AddCameras._draw_handle = None
 
     def _start_fly_review(self, context, add_modal_handler=True):
         """Frame the first camera and start fly-through review.
@@ -2664,6 +3295,18 @@ class AddCameras(bpy.types.Operator):
         self._last_time = time.time()
         bpy.ops.view3d.fly('INVOKE_DEFAULT')
         return True
+
+    def _finish_without_review(self, context):
+        """Clean up draw handler and restore state without fly-through."""
+        if AddCameras._draw_handle:
+            bpy.types.SpaceView3D.draw_handler_remove(
+                AddCameras._draw_handle, 'WINDOW')
+            AddCameras._draw_handle = None
+        if self._cameras:
+            context.scene.camera = self._cameras[0]
+        _sg_restore_label_overlay()
+        self.report({'INFO'},
+                    f"Cameras added successfully ({len(self._cameras)} cameras).")
 
     # -------------------------------------------------------
     # Placement methods
@@ -2934,6 +3577,48 @@ class AddCameras(bpy.types.Operator):
                             :min(state['num_cameras'],
                                  len(directions))]
 
+                    elif result_type == 'vis_kmeans':
+                        # Visibility-weighted K-means: weight by fraction
+                        vis_count = done.value
+                        n_cand = 200
+                        vis_fraction = vis_count.astype(float) / n_cand
+                        exterior = vis_count > 0
+                        normals = state['normals'][exterior]
+                        areas_base = state['areas'][exterior]
+                        weighted_areas = areas_base * vis_fraction[exterior]
+                        n_ext = int(exterior.sum())
+                        n_removed = len(vis_count) - n_ext
+                        self.report({'INFO'},
+                            f"Visibility-weighted: {n_ext} visible faces, "
+                            f"{n_removed} fully occluded removed")
+                        k = min(state['num_cameras'], len(normals))
+                        if k > 0 and len(normals) > 0:
+                            cluster_dirs = _kmeans_on_sphere(
+                                normals, weighted_areas, k)
+                            directions = [cluster_dirs[i]
+                                          for i in range(len(cluster_dirs))]
+                        else:
+                            directions = []
+
+                    elif result_type == 'vis_interactive':
+                        # Enter interactive preview phase
+                        vis_count = done.value
+                        self._vis_count = vis_count
+                        self._vis_n_candidates = 200
+                        self._vis_balance = 0.2
+                        self._vis_preview_phase = True
+                        self._vis_state = state
+                        self._occ_state = None
+                        self._update_vis_cameras(context)
+                        return {'RUNNING_MODAL'}
+
+                    # Angular dedup against existing cameras (filter paths)
+                    ex_dirs = state.get('existing_dirs')
+                    if ex_dirs and result_type in (
+                            'filter_kmeans', 'filter_pca', 'vis_kmeans'):
+                        directions = _filter_near_existing(
+                            directions, ex_dirs)
+
                     # Finalize cameras (sort, aspect, create, prompts)
                     self._finalize_auto_cameras(
                         context, directions,
@@ -2942,13 +3627,78 @@ class AddCameras(bpy.types.Operator):
                     self._occ_state = None
 
                     # Transition to fly-through review
-                    if not self._start_fly_review(
-                            context, add_modal_handler=False):
-                        return {'CANCELLED'}
-                    # Stay in modal for the fly-through phase
+                    if self.review_placement:
+                        if not self._start_fly_review(
+                                context, add_modal_handler=False):
+                            return {'CANCELLED'}
+                        # Stay in modal for the fly-through phase
+                    else:
+                        self._finish_without_review(context)
+                        return {'FINISHED'}
                 return {'RUNNING_MODAL'}
 
             # Let Blender process UI events during occlusion
+            return {'RUNNING_MODAL'}
+
+        # ── Interactive visibility preview phase ─────────────────────────
+        if self._vis_preview_phase:
+            if event.type in {'ESC', 'RIGHTMOUSE'} and event.value == 'PRESS':
+                self._cleanup_vis_preview(context)
+                self.report({'WARNING'}, "Interactive visibility cancelled.")
+                return {'CANCELLED'}
+
+            changed = False
+            if event.type == 'WHEELUPMOUSE':
+                self._vis_balance = min(1.0, self._vis_balance + 0.05)
+                changed = True
+            elif event.type == 'WHEELDOWNMOUSE':
+                self._vis_balance = max(0.0, self._vis_balance - 0.05)
+                changed = True
+            elif event.type == 'NUMPAD_PLUS' and event.value == 'PRESS':
+                self._vis_balance = min(1.0, self._vis_balance + 0.05)
+                changed = True
+            elif event.type == 'NUMPAD_MINUS' and event.value == 'PRESS':
+                self._vis_balance = max(0.0, self._vis_balance - 0.05)
+                changed = True
+
+            if changed:
+                self._update_vis_cameras(context)
+                for area in context.screen.areas:
+                    if area.type == 'VIEW_3D':
+                        area.tag_redraw()
+                return {'RUNNING_MODAL'}
+
+            if event.type in {'RET', 'SPACE'} and event.value == 'PRESS':
+                # Confirm: finalize with current directions
+                self._vis_preview_phase = False
+                context.area.header_text_set(None)
+
+                # Delete preview cameras
+                for cam in list(self._cameras):
+                    cam_data = cam.data
+                    bpy.data.objects.remove(cam, do_unlink=True)
+                    if cam_data and not cam_data.users:
+                        bpy.data.cameras.remove(cam_data)
+                self._cameras.clear()
+
+                state = self._vis_state
+                self._finalize_auto_cameras(
+                    context, self._vis_directions,
+                    state['verts_world'], state['mesh_center'],
+                    state['cam_settings'], state['temp_cam_data'])
+                self._vis_state = None
+                self._vis_count = None
+
+                # Transition to fly-through or finish
+                if self.review_placement:
+                    if not self._start_fly_review(
+                            context, add_modal_handler=False):
+                        return {'CANCELLED'}
+                else:
+                    self._finish_without_review(context)
+                    return {'FINISHED'}
+                return {'RUNNING_MODAL'}
+
             return {'RUNNING_MODAL'}
 
         # ── Fly-through review phase ─────────────────────────────────────

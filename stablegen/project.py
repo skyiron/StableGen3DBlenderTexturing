@@ -532,6 +532,22 @@ def create_native_feather(nodes, links, normalize_node, camera_fov_node, camera_
 
     return final_feather
 
+
+_SG_VORONOI_PLACEHOLDER_NAME = "_SG_Voronoi_Placeholder"
+
+def _get_voronoi_placeholder(color=(1.0, 0.0, 1.0)):
+    """Get or create a 1x1 solid-colour image used as placeholder for
+    non-generated cameras in Voronoi projection mode.  The colour is
+    updated every call so it always matches the current setting."""
+    img = bpy.data.images.get(_SG_VORONOI_PLACEHOLDER_NAME)
+    if img is None:
+        img = bpy.data.images.new(_SG_VORONOI_PLACEHOLDER_NAME, width=1, height=1)
+        img.colorspace_settings.name = 'Non-Color'
+        img.pack()
+    img.pixels[:] = [color[0], color[1], color[2], 1.0]
+    return img
+
+
 def project_image(context, to_project, mat_id, stop_index=1000000):
     """     
     Projects an image onto all mesh objects using UV Project Modifier.     
@@ -556,6 +572,21 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
         Returns:
         A tuple (final_shader, final_weight_node).
         """
+
+        def _combine_angle_feather(nodes_col, lnk, cr_angle_out, cr_feather_out, loc):
+            """Combine angle-ramp and feather-ramp outputs into a single
+            visibility weight: ``angle_vis × feather_vis``.
+
+            Returns the output node of the final MULTIPLY.
+            """
+            x, y = loc
+            mult = nodes_col.new("ShaderNodeMath")
+            mult.operation = 'MULTIPLY'
+            mult.location = (x, y)
+            lnk.new(cr_angle_out, mult.inputs[0])
+            lnk.new(cr_feather_out, mult.inputs[1])
+            return mult
+
         # Compute offsets based on recursion level
         is_local_edit = (context.scene.generation_method == 'local_edit' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'local_edit'))
         if is_local_edit:
@@ -580,7 +611,9 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
             if is_local_edit:
                 w_node = weight_nodes[0]
                 if isinstance(w_node, tuple):
-                    angle_node, feather_node = w_node
+                    angle_node = w_node[0]
+                    feather_node = w_node[1]
+                    ef_node = w_node[2] if len(w_node) >= 3 else None
                     
                     # Create Ramps (Output Visibility: 0=Invis, 1=Vis)
                     # Angle Ramp
@@ -603,19 +636,30 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                     cr_feather.color_ramp.interpolation = 'LINEAR'
                     links.new(feather_node.outputs[0], cr_feather.inputs[0])
                     
-                    # Multiply (Intersection of Visibility)
-                    mult = nodes_collection.new("ShaderNodeMath")
-                    mult.operation = 'MULTIPLY'
-                    mult.location = (x_offset - 300, y_offset)
-                    links.new(cr_angle.outputs[0], mult.inputs[0])
-                    links.new(cr_feather.outputs[0], mult.inputs[1])
+                    # Combine angle and feather visibility
+                    mult = _combine_angle_feather(
+                        nodes_collection, links,
+                        cr_angle.outputs[0], cr_feather.outputs[0],
+                        loc=(x_offset - 300, y_offset)
+                    )
+
+                    # Optionally multiply by edge-feather mask
+                    if ef_node is not None:
+                        ef_mult = nodes_collection.new("ShaderNodeMath")
+                        ef_mult.operation = 'MULTIPLY'
+                        ef_mult.location = (x_offset - 200, y_offset - 80)
+                        links.new(mult.outputs[0], ef_mult.inputs[0])
+                        links.new(ef_node.outputs[0], ef_mult.inputs[1])
+                        weight_out = ef_mult
+                    else:
+                        weight_out = mult
                     
                     # Invert (Convert Visibility to Mix Factor: 1=Vis->0=Proj, 0=Invis->1=Orig)
                     invert = nodes_collection.new("ShaderNodeMath")
                     invert.operation = 'SUBTRACT'
                     invert.location = (x_offset - 150, y_offset)
                     invert.inputs[0].default_value = 1.0
-                    links.new(mult.outputs[0], invert.inputs[1])
+                    links.new(weight_out.outputs[0], invert.inputs[1])
 
                     compare_node = invert # For return
                     links.new(invert.outputs[0], final_mix.inputs["Fac"])
@@ -665,6 +709,165 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
             links.new(final_mix.outputs[0], final_principled.inputs[0])
             return final_principled, compare_node
 
+        # ── Helper: extract final weight output from a weight_node item ────
+        def _get_weight_output(w_item, v_offset):
+            """Process a weight_node item (tuple or plain node) through ramps
+            and return the output socket.  Used by the normalization pre-pass."""
+            if isinstance(w_item, tuple):
+                angle_node = w_item[0]
+                feather_node = w_item[1]
+                ef_node = w_item[2] if len(w_item) >= 3 else None
+
+                # Angle Ramp
+                cr_angle = nodes_collection.new("ShaderNodeValToRGB")
+                cr_angle.location = (x_offset - 1100, y_offset + v_offset)
+                cr_angle.color_ramp.elements[0].position = context.scene.refine_angle_ramp_pos_0 if context.scene.refine_angle_ramp_active else 0.0
+                cr_angle.color_ramp.elements[0].color = (0, 0, 0, 1)
+                cr_angle.color_ramp.elements[1].position = context.scene.refine_angle_ramp_pos_1 if context.scene.refine_angle_ramp_active else 0.0
+                cr_angle.color_ramp.elements[1].color = (1, 1, 1, 1)
+                cr_angle.color_ramp.interpolation = 'LINEAR'
+                links.new(angle_node.outputs[0], cr_angle.inputs[0])
+
+                # Feather Ramp
+                cr_feather = nodes_collection.new("ShaderNodeValToRGB")
+                cr_feather.location = (x_offset - 1100, y_offset + v_offset - 200)
+                cr_feather.color_ramp.elements[0].position = context.scene.refine_feather_ramp_pos_0 if context.scene.visibility_vignette else 0.0
+                cr_feather.color_ramp.elements[0].color = (0, 0, 0, 1)
+                cr_feather.color_ramp.elements[1].position = context.scene.refine_feather_ramp_pos_1 if context.scene.visibility_vignette else 0.0
+                cr_feather.color_ramp.elements[1].color = (1, 1, 1, 1)
+                cr_feather.color_ramp.interpolation = 'LINEAR'
+                links.new(feather_node.outputs[0], cr_feather.inputs[0])
+
+                # Combine angle × feather
+                m = _combine_angle_feather(
+                    nodes_collection, links,
+                    cr_angle.outputs[0], cr_feather.outputs[0],
+                    loc=(x_offset - 900, y_offset + v_offset)
+                )
+
+                # Optionally multiply by edge-feather mask
+                if ef_node is not None:
+                    ef_mult = nodes_collection.new("ShaderNodeMath")
+                    ef_mult.operation = 'MULTIPLY'
+                    ef_mult.location = (x_offset - 800, y_offset + v_offset - 80)
+                    links.new(m.outputs[0], ef_mult.inputs[0])
+                    links.new(ef_node.outputs[0], ef_mult.inputs[1])
+                    return ef_mult.outputs[0]
+
+                return m.outputs[0]
+            else:
+                return w_item.outputs[0]
+
+        # ── Max-relative weight normalization (level 0 only) ──────────────
+        # At high weight exponents, pow(cos(θ), exp) can underflow to 0 in
+        # float32 for every camera, making the w_A/(w_A+w_B) ratio become
+        # 0/0 → black.  To fix this robustly we:
+        #   1. Temporarily set each per-camera Power to 1.0 so the weight
+        #      outputs become the *base* values (binary_gates × |cos(θ)|)
+        #      that never underflow.
+        #   2. Normalize those base weights by the per-pixel maximum so the
+        #      best camera gets 1.0.
+        #   3. Re-apply the user exponent to the normalized [0,1] values
+        #      where underflow is impossible.
+        # Mathematically: pow(cos/max_cos, exp) == pow(cos, exp)/pow(max_cos, exp),
+        # so the blending ratios are identical to the original formula.
+        if level == 0 and len(shaders) > 1:
+            # ── Step 1: Neutralize per-camera Power (set to 1.0) ──────
+            user_exponent = None
+            for idx in range(len(weight_nodes)):
+                w = weight_nodes[idx]
+                node = w[0] if isinstance(w, tuple) else w
+
+                # Skip disabled cameras (stop_index → LESS_THAN always-0)
+                if node.type == 'MATH' and node.operation == 'LESS_THAN':
+                    continue
+
+                # Native raycast path:
+                #   final_weight (MULTIPLY, label Angle-*) →
+                #       inputs[1] → power_node (POWER, label power_weight)
+                if (node.type == 'MATH' and node.operation == 'MULTIPLY'
+                        and node.label.startswith('Angle-')):
+                    if node.inputs[1].links:
+                        pn = node.inputs[1].links[0].from_node
+                        if (pn.type == 'MATH' and pn.operation == 'POWER'
+                                and pn.label == 'power_weight'):
+                            if user_exponent is None:
+                                user_exponent = pn.inputs[1].default_value
+                            pn.inputs[1].default_value = 1.0
+
+                # OSL path: ShaderNodeScript with "Power" input
+                elif node.type == 'SCRIPT' and "Power" in node.inputs:
+                    if user_exponent is None:
+                        user_exponent = node.inputs["Power"].default_value
+                    node.inputs["Power"].default_value = 1.0
+
+            if user_exponent is None:
+                user_exponent = 1.0
+
+            # ── Step 2: Get base weight outputs (now power = 1) ───────
+            all_w_outputs = []
+            for idx in range(len(weight_nodes)):
+                v_off = -200 * idx
+                all_w_outputs.append(_get_weight_output(weight_nodes[idx], v_off))
+
+            # ── Step 3: Find per-pixel maximum ────────────────────────
+            max_node = nodes_collection.new("ShaderNodeMath")
+            max_node.operation = 'MAXIMUM'
+            max_node.location = (x_offset - 1500, y_offset - 600)
+            max_node.label = "WeightMax"
+            links.new(all_w_outputs[0], max_node.inputs[0])
+            if len(all_w_outputs) > 1:
+                links.new(all_w_outputs[1], max_node.inputs[1])
+            else:
+                max_node.inputs[1].default_value = 0.0
+
+            for idx in range(2, len(all_w_outputs)):
+                next_max = nodes_collection.new("ShaderNodeMath")
+                next_max.operation = 'MAXIMUM'
+                next_max.location = (x_offset - 1500 + 150 * (idx - 1),
+                                     y_offset - 600)
+                next_max.label = "WeightMax"
+                links.new(max_node.outputs[0], next_max.inputs[0])
+                links.new(all_w_outputs[idx], next_max.inputs[1])
+                max_node = next_max
+
+            # Clamp max to epsilon to prevent 0/0 division
+            safe_max = nodes_collection.new("ShaderNodeMath")
+            safe_max.operation = 'MAXIMUM'
+            safe_max.location = (max_node.location[0] + 150, y_offset - 600)
+            safe_max.inputs[1].default_value = 1e-7
+            safe_max.label = "SafeMax"
+            links.new(max_node.outputs[0], safe_max.inputs[0])
+
+            # ── Step 4: Normalize + re-apply exponent ─────────────────
+            powered_nodes = []
+            for idx, w_out in enumerate(all_w_outputs):
+                # norm_w = base_w / max(base_w)
+                div = nodes_collection.new("ShaderNodeMath")
+                div.operation = 'DIVIDE'
+                div.location = (safe_max.location[0] + 200,
+                                y_offset - 120 * idx)
+                div.label = f"NormW-{idx}"
+                links.new(w_out, div.inputs[0])
+                links.new(safe_max.outputs[0], div.inputs[1])
+
+                # sharp_w = pow(norm_w, user_exponent)
+                # (inputs are in [0, 1] → no underflow possible)
+                if user_exponent != 1.0:
+                    pw = nodes_collection.new("ShaderNodeMath")
+                    pw.operation = 'POWER'
+                    pw.location = (div.location[0] + 200,
+                                   div.location[1])
+                    pw.label = f"SharpW-{idx}"
+                    pw.inputs[1].default_value = user_exponent
+                    links.new(div.outputs[0], pw.inputs[0])
+                    powered_nodes.append(pw)
+                else:
+                    powered_nodes.append(div)
+
+            # Replace weight_nodes with sharpened-normalised nodes
+            weight_nodes = powered_nodes
+
         new_shaders = []
         new_weight_nodes = []
         i = 0
@@ -678,7 +881,9 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                 
                 def get_weight_output(w_item):
                     if isinstance(w_item, tuple):
-                        angle_node, feather_node = w_item
+                        angle_node = w_item[0]
+                        feather_node = w_item[1]
+                        ef_node = w_item[2] if len(w_item) >= 3 else None
                         
                         # Create Ramps (Output Visibility: 0=Invis, 1=Vis)
                         # Angle Ramp
@@ -701,12 +906,22 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                         cr_feather.color_ramp.interpolation = 'LINEAR'
                         links.new(feather_node.outputs[0], cr_feather.inputs[0])
                         
-                        # Multiply (Intersection of Visibility)
-                        m = nodes_collection.new("ShaderNodeMath")
-                        m.operation = 'MULTIPLY'
-                        m.location = (x_offset - 900, y_offset + vert_offset)
-                        links.new(cr_angle.outputs[0], m.inputs[0])
-                        links.new(cr_feather.outputs[0], m.inputs[1])
+                        # Combine angle and feather visibility
+                        m = _combine_angle_feather(
+                            nodes_collection, links,
+                            cr_angle.outputs[0], cr_feather.outputs[0],
+                            loc=(x_offset - 900, y_offset + vert_offset)
+                        )
+
+                        # Optionally multiply by edge-feather mask
+                        if ef_node is not None:
+                            ef_mult = nodes_collection.new("ShaderNodeMath")
+                            ef_mult.operation = 'MULTIPLY'
+                            ef_mult.location = (x_offset - 800, y_offset + vert_offset - 80)
+                            links.new(m.outputs[0], ef_mult.inputs[0])
+                            links.new(ef_node.outputs[0], ef_mult.inputs[1])
+                            return ef_mult.outputs[0]
+
                         return m.outputs[0]
                     else:
                         return w_item.outputs[0]
@@ -978,6 +1193,49 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
         camera_direction_nodes = []
         camera_up_nodes = []
 
+        def _create_edge_feather_weight(cam_index, mat_id_inner):
+            """Load the edge-feathered visibility mask for camera *cam_index*
+            and return a shader Math node whose output[0] gives a 0..1 float
+            weight (0 = edge/invisible, 1 = interior/full), or *None* on failure.
+
+            The mask is UV-projected through the same camera UV attribute
+            that projects the generated image.
+            """
+            vis_dir = get_dir_path(context, "inpaint")["visibility"]
+            ef_path = os.path.join(vis_dir, f"render{cam_index}_edgefeather.png")
+            if not os.path.exists(ef_path):
+                print(f"[StableGen] Edge-feather mask not found: {ef_path}")
+                return None
+            ef_image = get_or_load_image(ef_path, force_reload=context.scene.overwrite_material)
+            if ef_image is None:
+                return None
+
+            # Image Texture node to sample the mask via camera UV
+            mask_tex = nodes.new("ShaderNodeTexImage")
+            mask_tex.image = ef_image
+            mask_tex.extension = 'CLIP'
+            mask_tex.label = f"EdgeFeather-{cam_index}-{mat_id_inner}"
+            mask_tex.location = (-500, -200 * cam_index - 150)
+
+            # Connect to the same camera UV attribute
+            uv_node = uv_map_nodes[cam_index]
+            uv_out = "Vector" if uv_node.type == 'ATTRIBUTE' else "UV"
+            links.new(uv_node.outputs[uv_out], mask_tex.inputs["Vector"])
+
+            # Color→Float conversion via a pass-through Math node
+            to_float = nodes.new("ShaderNodeMath")
+            to_float.operation = 'MULTIPLY'
+            to_float.inputs[1].default_value = 1.0
+            to_float.location = (-300, -200 * cam_index - 150)
+            to_float.label = f"EF_Weight-{cam_index}"
+            links.new(mask_tex.outputs[0], to_float.inputs[0])
+            return to_float
+
+        # Voronoi mode flag: keep natural weights for non-generated cameras
+        voronoi_active = (context.scene.model_architecture == 'qwen_image_edit'
+                          and getattr(context.scene, 'qwen_voronoi_mode', False)
+                          and context.scene.generation_method == 'sequential')
+
         for i, camera in enumerate(cameras):
             # Add image texture node
             tex_image = nodes.new("ShaderNodeTexImage")
@@ -990,6 +1248,13 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                 image = get_or_load_image(image_path, force_reload=context.scene.overwrite_material)
                 if image:
                     tex_image.image = image
+            elif voronoi_active:
+                # Voronoi mode: assign a solid placeholder matching the Qwen
+                # guidance fallback colour so non-generated cameras contribute
+                # that colour instead of black.
+                voronoi_color = tuple(context.scene.qwen_guidance_fallback_color)
+                tex_image.image = _get_voronoi_placeholder(voronoi_color)
+                tex_image.interpolation = 'Closest'
 
             tex_image.location = (0, -200 * i)
             tex_image.extension = 'CLIP'
@@ -1024,13 +1289,21 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                         nodes, links, normalize_node, camera_fov_node, camera_aspect_node,
                         camera_dir_node, camera_up_node, context, i, mat_id
                     )
-                    final_weight_node = (angle_weight, feather_weight)
+                    # Optionally add edge-feather mask as third multiplier
+                    if context.scene.refine_edge_feather_projection and i <= stop_index:
+                        ef_node = _create_edge_feather_weight(i, mat_id)
+                        if ef_node is not None:
+                            final_weight_node = (angle_weight, feather_weight, ef_node)
+                        else:
+                            final_weight_node = (angle_weight, feather_weight)
+                    else:
+                        final_weight_node = (angle_weight, feather_weight)
                 else:
                     final_weight_node = angle_weight
 
                 script_nodes.append(scripts_to_connect)
 
-                if i > stop_index:
+                if i > stop_index and not voronoi_active:
                     less_than = nodes.new("ShaderNodeMath")
                     less_than.operation = 'LESS_THAN'
                     less_than.location = (-200, (-800) * i)
@@ -1087,7 +1360,7 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                     # Add Feather script
                     script_feather = nodes.new("ShaderNodeScript")
                     script_feather.location = (-400, (-800) * i - 200) # Offset slightly
-                    
+
                     # Load OSL script into internal text block for portability
                     feather_osl_text = get_or_create_osl_text("feather.osl")
                     if feather_osl_text:
@@ -1096,7 +1369,7 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                     else:
                         script_feather.mode = 'EXTERNAL'
                         script_feather.filepath = os.path.join(os.path.dirname(__file__), "feather.osl")
-                    
+
                     if context.scene.visibility_vignette: # Only set if feathering is active
                         script_feather.inputs["EdgeFeather"].default_value = context.scene.visibility_vignette_width
                         script_feather.inputs["EdgeGamma"].default_value = context.scene.visibility_vignette_softness
@@ -1106,15 +1379,22 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                     script_feather.label = f"Feather-{i}-{mat_id}"
                     scripts_to_connect.append(script_feather)
 
-                    # Pass tuple of (Angle, Feather) to build_mix_tree
-                    final_weight_node = (script_angle, script_feather)
+                    # Optionally add edge-feather mask as third multiplier
+                    if context.scene.refine_edge_feather_projection and i <= stop_index:
+                        ef_node = _create_edge_feather_weight(i, mat_id)
+                        if ef_node is not None:
+                            final_weight_node = (script_angle, script_feather, ef_node)
+                        else:
+                            final_weight_node = (script_angle, script_feather)
+                    else:
+                        final_weight_node = (script_angle, script_feather)
                 else:
                     # Just use Angle script output directly
                     final_weight_node = script_angle
 
                 script_nodes.append(scripts_to_connect)
 
-                if i > stop_index:
+                if i > stop_index and not voronoi_active:
                     # Connect a temporary less than node to the script node
                     less_than = nodes.new("ShaderNodeMath")
                     less_than.operation = 'LESS_THAN'
